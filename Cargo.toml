@@ -1,0 +1,8 @@
+[package]
+name = "monte-carlo-geometry-kernel"
+publish = false
+edition = "2024"
+
+
+[dependencies]
+libm = "0.2"
