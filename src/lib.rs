@@ -1,4 +1,5 @@
 #![no_std]
+
 //! # `geom_kernel_wos.rs` — A `no_std`, safe, geometry kernel for grid-free Monte-Carlo geometry processing
 //!
 //! This file implements core abstractions and a reference implementation of
@@ -45,7 +46,7 @@
 //! environment must provide a global allocator.
 //!
 //! ## Extending this kernel
-//! - Add Poisson estimators.
+//! - Support more PDEs.
 //! - Add GPU/vectorized closest-point backends.
 //! - Add Neumann/Robin boundary conditions and mixed problems.
 //! - Add gradients if not already available.
@@ -80,7 +81,7 @@ use core::cmp::Ordering;
 use core::f32::consts::PI;
 use core::fmt;
 use core::ops::{Add, AddAssign, Div, Mul, Neg, Sub, SubAssign};
-use libm::{cosf, sinf, sqrtf};
+use libm::{cosf, powf, sinf, sqrtf};
 
 /// ### `math` — Minimal 3D math (no_std)
 ///
@@ -241,12 +242,6 @@ mod math {
             let min = a.min(b).min(c);
             let max = a.max(b).max(c);
             Self { min, max }
-        }
-
-        #[inline]
-        pub fn grow(&mut self, p: Vec3) {
-            self.min = self.min.min(p);
-            self.max = self.max.max(p);
         }
 
         #[inline]
@@ -961,6 +956,40 @@ impl WosParams {
     }
 }
 
+/// ### Uniform sampling in a 3D ball
+///
+/// Draws `Y ~ Uniform(B(x, R))`. Used for Monte Carlo estimation of the domain integral
+/// in Poisson problems via importance sampling with a uniform pdf.
+/// (pdf = 1 / Vol(B), where Vol(B) = 4/3 π R³)
+#[inline]
+fn sample_point_in_ball(rng: &mut Rng, center: Vec3, radius: f32) -> Vec3 {
+    // Sample direction on S²
+    let dir = sample_unit_sphere(rng);
+    // Radius with correct volume pdf: r = R * u^(1/3)
+    let u = rng.uniform_f32().max(1e-7);
+    center + dir * (radius * powf(u, 1.0 / 3.0))
+}
+
+/// Volume of a 3D ball of radius R.
+#[inline]
+fn ball_volume(radius: f32) -> f32 {
+    (4.0 / 3.0) * PI * radius * radius * radius
+}
+
+/// ### Dirichlet Green's function on a ball in 3D
+///
+/// Green_B(x,y) for a ball B(x,R) centered at `x` with radius `R`, evaluated at distance `r=|y-x|`.
+/// See Sawhney & Crane (2020), Appendix A (also reproduced in the WoSt paper):
+/// G_B^3D(x,y) = (1 / 4π) * (1/r - 1/R), for 0 < r <= R.
+///
+/// Notes:
+/// - Singular at r=0, but this happens with probability zero for continuous sampling; we clamp.
+#[inline]
+fn green_ball_3d(radius: f32, r: f32) -> f32 {
+    let r = r.max(1e-7);
+    (1.0 / (4.0 * PI)) * (1.0 / r - 1.0 / radius)
+}
+
 /// ### Uniform sampling on the unit sphere (S²)
 ///
 /// Uses a branch-free method based on two uniforms.
@@ -1056,42 +1085,134 @@ impl<'a> ClosestAccel<PolygonSoupDomain> for BvhAccel<'a> {
     }
 }
 
-/// ### (Scaffold) Poisson estimator
+/// ### Poisson estimator settings
 ///
-/// The classical WoS is exact for Laplace problems. For `Δu = f` (Poisson) in ℝ³,
-/// unbiased estimators integrate the source via Green’s function or related
-/// randomization tricks (see paper §2.3, §3 for derivatives/estimators).
+/// Unbiased estimator for the Dirichlet Poisson problem **in 3D** using WoS + per-step
+/// Monte Carlo integration inside each largest empty ball.
 ///
-/// Here we provide a **hook** that allows users to inject a problem-specific integral
-/// estimator for the source term while reusing WoS skeleton for boundary handling.
+/// **Convention solved here:** `-Δ u = f` in Ω, `u = g` on ∂Ω.  
+/// (This is the common potential-theory sign so that a constant positive source yields
+/// a positive solution inside a unit ball.)
 ///
-/// The default implementation **returns the Laplace solution** (i.e., ignores `f`)
-/// and serves as a placeholder. Extend this function to implement your preferred
-/// source estimator (e.g., control variates, Russian roulette path sampling).
+/// The estimator adds, at *each* WoS step k with ball radius R_k:
+///   I_k ≈ Vol(B_k) * (1/M) Σ_i G_B^3D(R_k, |Y_i - x_k|) * f(Y_i),
+/// where `Y_i ~ Uniform(B_k)`. Summing I_k over steps is an unbiased estimate of the
+/// domain integral term; termination on ∂Ω yields the boundary term `g`.
+#[derive(Copy, Clone, Debug)]
+pub struct PoissonParams {
+    /// Number of interior samples per WoS step. `1` is unbiased and cheapest;
+    /// larger values reduce variance.
+    pub interior_samples_per_step: u32,
+    /// Clamp for near-singularity in Green_B at r≈0 (numerical safety).
+    pub min_r: f32,
+}
+impl PoissonParams {
+    pub const fn new(interior_samples_per_step: u32) -> Self {
+        Self {
+            interior_samples_per_step,
+            min_r: 1e-7,
+        }
+    }
+    pub const fn with_min_r(self, min_r: f32) -> Self {
+        Self { min_r, ..self }
+    }
+}
+
+/// Source term `f(x)` in the PDE **-Δ u = f** (3D).
+///
+/// If your PDE is written as `Δ u = f`, pass `-f` here.
 pub trait SourceTerm: Send + Sync {
-    /// Source `f(x)` in `Δu = f`.
     fn value(&self, x: Vec3) -> f32;
 }
 
-pub fn wos_poisson_dirichlet<D: Domain, G: BoundaryDirichlet, F: SourceTerm>(
+/// ### Poisson (Dirichlet) estimator via Walk-on-Spheres + ball Green function
+///
+/// Solves the **3D** Poisson problem with Dirichlet boundary data `g`:
+/// ```text
+///   -Δ u = f   in Ω,
+///        u = g on ∂Ω.
+/// ```
+/// Returns a **single-path** unbiased Monte Carlo estimate of `u(x)` using:
+/// - **WoS** for boundary hitting,
+/// - **Uniform-in-ball sampling** inside each largest empty ball to estimate the
+///   domain integral with the **Dirichlet Green function on a ball**.
+///
+/// Variance controls:
+/// - Increase `poisson.interior_samples_per_step`.
+/// - Average multiple independent calls (standard MC `1/N` variance).
+///
+/// Future extensions:
+/// - Screened Poisson: multiply per-step weights by `Q_σ,B` (§A.2 in WoSt paper).
+/// - Control variates (§4 in MC-Geometry paper).
+#[allow(non_snake_case)]
+pub fn wos_poisson_dirichlet<D, G, F>(
     domain: &D,
     accel: &impl ClosestAccel<D>,
     g: &G,
-    _f: &F,
+    fsrc: &F,
     params: WosParams,
+    poisson: PoissonParams,
     rng: &mut Rng,
-    x: Vec3,
-) -> f32 {
-    // Placeholder: return Laplace solution. Replace by integrating f along the walk
-    // with appropriate kernel (e.g., free-space Green’s function) and/or control variates.
-    wos_laplace_dirichlet(domain, accel, g, params, rng, x)
+    mut x: Vec3,
+) -> f32
+where
+    D: Domain,
+    G: BoundaryDirichlet,
+    F: SourceTerm,
+{
+    debug_assert!(
+        domain.is_inside(x),
+        "wos_poisson_dirichlet: x must be inside Ω"
+    );
+
+    let mut steps = 0u32;
+    let mut acc = 0.0_f32; // accumulated interior (source) contribution
+
+    loop {
+        // Largest empty ball at current x
+        let c = accel.closest(domain, x);
+        let R = c.distance;
+
+        // If close to boundary: terminate and add Dirichlet value
+        if R <= params.epsilon {
+            // boundary term
+            let bdry = g.value(c.point);
+            return acc + bdry;
+        }
+
+        // --- Domain integral contribution over B(x, R) via MC:
+        // Estimate ∫_{B(x,R)} G_B^3D(x,y) f(y) dy  using uniform sampling
+        //  I ≈ Vol(B) * (1/M) Σ G_B(R, |Y_i-x|) f(Y_i),  Y_i ~ Uniform(B)
+        let vol = ball_volume(R);
+        let m = poisson.interior_samples_per_step.max(1);
+        let inv_m = 1.0 / (m as f32);
+        let mut sum_gf = 0.0f32;
+
+        for _ in 0..m {
+            let y = sample_point_in_ball(rng, x, R);
+            let r = (y - x).length().max(poisson.min_r);
+            let gball = green_ball_3d(R, r);
+            sum_gf += gball * fsrc.value(y);
+        }
+        acc += vol * (sum_gf * inv_m);
+
+        // --- WoS jump to the sphere S(x, R)
+        x = wos_jump(x, R, rng);
+
+        steps += 1;
+        if steps >= params.max_steps {
+            // Conservative fallback: sample boundary and return accumulated integral + boundary
+            let c = accel.closest(domain, x);
+            return acc + g.value(c.point);
+        }
+    }
 }
 
 mod tests {
     use crate::*;
 
     #[test]
-    fn smoke() {
+    fn laplacian_dirichlet_smoke() {
         // Define a sphere SDF of radius 1 at origin:
         let sphere = SdfDomain::new(|p: Vec3| p.length() - 1.0);
 
@@ -1112,5 +1233,89 @@ mod tests {
             Vec3::new(0.0, 0.0, 0.0),
         );
         assert!((u - 1.0).abs() < 5e-2); // stochastic tolerance
+    }
+
+    /// Constant Dirichlet Poisson in the unit ball:
+    ///  - domain: φ(p)=|p|-1 (unit ball),
+    ///  - PDE:    -Δ u = 1 in Ω,  u = 0 on ∂Ω,
+    ///  - exact:  u(r) = (1 - r^2)/6  in 3D.
+    ///
+    /// We test at the center (r=0): u(0) = 1/6 ≈ 0.166666...
+    #[test]
+    fn poisson_unit_ball_constant_source_center() {
+        let sphere = SdfDomain::new(|p: Vec3| p.length() - 1.0);
+        let g0 = BoundaryDirichletFn::new(|_p| 0.0);
+        // Source f ≡ 1  (matches -Δ u = 1)
+        struct One;
+        impl SourceTerm for One {
+            #[inline]
+            fn value(&self, _x: Vec3) -> f32 {
+                1.0
+            }
+        }
+        let fsrc = One;
+
+        let params = WosParams::new(1e-4, 20_000);
+        let poisson = PoissonParams::new(8); // 8 interior samples per step helps variance
+        let mut rng = rng::Rng::seed_from(1234);
+
+        // Expect ~1/6 at center
+        let u = wos_poisson_dirichlet(
+            &sphere,
+            &ClosestNaive,
+            &g0,
+            &fsrc,
+            params,
+            poisson,
+            &mut rng,
+            Vec3::new(0.0, 0.0, 0.0),
+        );
+
+        // Loose MC tolerance; tighten as needed.
+        let exact = 1.0 / 6.0;
+        assert!((u - exact).abs() < 0.06, "u(0)≈{exact}, got {u}");
+    }
+
+    /// Regression: when f ≡ 0, Poisson reduces to Laplace estimator.
+    #[test]
+    fn poisson_reduces_to_laplace_when_source_zero() {
+        let sphere = SdfDomain::new(|p: Vec3| p.length() - 1.0);
+        let g = BoundaryDirichletFn::new(|_p| 1.0);
+        struct Zero;
+        impl SourceTerm for Zero {
+            #[inline]
+            fn value(&self, _x: Vec3) -> f32 {
+                0.0
+            }
+        }
+
+        let params = WosParams::new(1e-4, 10_000);
+        let poisson = PoissonParams::new(1);
+        let mut rng1 = rng::Rng::seed_from(7);
+        let mut rng2 = rng::Rng::seed_from(7);
+
+        let u_lap = wos_laplace_dirichlet(
+            &sphere,
+            &ClosestNaive,
+            &g,
+            params,
+            &mut rng1,
+            Vec3::new(0.0, 0.0, 0.0),
+        );
+        let u_pois = wos_poisson_dirichlet(
+            &sphere,
+            &ClosestNaive,
+            &g,
+            &Zero,
+            params,
+            poisson,
+            &mut rng2,
+            Vec3::new(0.0, 0.0, 0.0),
+        );
+
+        assert!(
+            (u_lap - u_pois).abs() < 5e-2,
+            "Poisson(f=0) should match Laplace"
+        );
     }
 }
