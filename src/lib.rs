@@ -956,6 +956,40 @@ impl WosParams {
     }
 }
 
+/// CDF for t=r/R under Green-ball pdf: F(t)=3 t^2 - 2 t^3.
+/// We invert with a few Newton steps; 3 iterations are plenty.
+#[inline]
+fn inv_cdf_green_ball(u: f32) -> f32 {
+    // Clamp u to (0,1)
+    let mut t = u.min(1.0 - 1e-7).max(1e-7); // initial guess
+    // Newton: solve F(t) - u = 0 ; F'(t)=6t - 6t^2
+    for _ in 0..3 {
+        let f = 3.0 * t * t - 2.0 * t * t * t - u;
+        let df = 6.0 * t - 6.0 * t * t;
+        // Guard against df≈0 at t≈0 or t≈1
+        let step = if df.abs() > 1e-6 { f / df } else { 0.0 };
+        t = (t - step).min(1.0 - 1e-7).max(1e-7);
+    }
+    t
+}
+
+/// Sample Y in B(center,R) with pdf p(y) ∝ G_B^{3D}(x,y).
+#[inline]
+fn sample_point_in_ball_green(rng: &mut Rng, center: Vec3, radius: f32) -> Vec3 {
+    let dir = sample_unit_sphere(rng); // uniform direction
+    let u = rng.uniform_f32().max(1e-7); // for radius via inverse CDF
+    let t = inv_cdf_green_ball(u); // t in (0,1)
+    let r = radius * t;
+    center + dir * r
+}
+
+#[inline]
+fn green_ball_integral_z(radius: f32) -> f32 {
+    // Z = ∫_B G d y
+    // From Appendix A: |G_B^3D(x)| = R^2 / 6
+    (radius * radius) / 6.0
+}
+
 /// ### Uniform sampling in a 3D ball
 ///
 /// Draws `Y ~ Uniform(B(x, R))`. Used for Monte Carlo estimation of the domain integral
@@ -1105,24 +1139,69 @@ pub struct PoissonParams {
     pub interior_samples_per_step: u32,
     /// Clamp for near-singularity in Green_B at r≈0 (numerical safety).
     pub min_r: f32,
+    pub sampling: InteriorSampling,
 }
 impl PoissonParams {
     pub const fn new(interior_samples_per_step: u32) -> Self {
         Self {
             interior_samples_per_step,
             min_r: 1e-7,
+            sampling: InteriorSampling::Uniform,
         }
     }
     pub const fn with_min_r(self, min_r: f32) -> Self {
         Self { min_r, ..self }
     }
+    pub const fn with_sampling(self, sampling: InteriorSampling) -> Self {
+        Self { sampling, ..self }
+    }
 }
 
-/// Source term `f(x)` in the PDE **-Δ u = f** (3D).
+/// How to sample interior points Y inside each WoS ball.
+#[derive(Copy, Clone, Debug, Eq, PartialEq)]
+pub enum InteriorSampling {
+    /// Uniform in ball: Y ~ Uniform(B(x,R))
+    Uniform,
+    /// Green-ball importance sampling: pdf p(y) ∝ G_B^{3D}(x,y)
+    ///
+    /// With this choice the integral ∫_B G f dy becomes Z * E[f(Y)]
+    /// where Z = ∫_B G dy = R²/6, so the weight is constant per step.
+    GreenBall,
+}
+
+/// Source term in the PDE **-Δ u = f** (3D).
 ///
 /// If your PDE is written as `Δ u = f`, pass `-f` here.
+///
+/// `point_params()` is an *optional* hint. By default it returns `None`.
+/// Implementations representing a single Dirac source should override it
+/// to return `Some((position, strength))`.
 pub trait SourceTerm: Send + Sync {
+    /// Evaluates a *regular* source at `x`. For a pure Dirac delta, this should return 0.
     fn value(&self, x: Vec3) -> f32;
+
+    /// Optional: return `(z, q)` if `f(y) = q · δ(y − z)`.
+    #[inline]
+    fn point_params(&self) -> Option<(Vec3, f32)> {
+        None
+    }
+}
+
+/// A concrete δ (Dirac) source:  f(y) = q · δ(y − z)
+pub struct PointSource {
+    pub position: Vec3,
+    pub strength: f32,
+}
+impl SourceTerm for PointSource {
+    /// δ is not sampleable by point eval
+    #[inline]
+    fn value(&self, _x: Vec3) -> f32 {
+        0.0
+    }
+    #[inline]
+    fn point_params(&self) -> Option<(Vec3, f32)> {
+        Some((self.position, self.strength))
+    }
 }
 
 /// ### Poisson (Dirichlet) estimator via Walk-on-Spheres + ball Green function
@@ -1166,50 +1245,138 @@ where
     );
 
     let mut steps = 0u32;
-    let mut acc = 0.0_f32; // accumulated interior (source) contribution
+    let mut acc = 0.0_f32;
+
+    // Optional point source
+    let point = fsrc.point_params();
 
     loop {
-        // Largest empty ball at current x
         let c = accel.closest(domain, x);
         let R = c.distance;
 
-        // If close to boundary: terminate and add Dirichlet value
         if R <= params.epsilon {
-            // boundary term
-            let bdry = g.value(c.point);
-            return acc + bdry;
+            return acc + g.value(c.point);
         }
 
-        // --- Domain integral contribution over B(x, R) via MC:
-        // Estimate ∫_{B(x,R)} G_B^3D(x,y) f(y) dy  using uniform sampling
-        //  I ≈ Vol(B) * (1/M) Σ G_B(R, |Y_i-x|) f(Y_i),  Y_i ~ Uniform(B)
-        let vol = ball_volume(R);
+        // -------- Point-source analytic contribution (if present)
+        if let Some((z, q)) = point {
+            let r = (z - x).length();
+            if r <= R {
+                // The δ integrates exactly over the ball: ∫_B G δ = G_B(x,z)
+                acc += q * green_ball_3d(R, r.max(poisson.min_r));
+                // Note: keep walking; other balls may contribute nothing for this δ.
+            }
+        }
+
+        // -------- Volume term for general sources
         let m = poisson.interior_samples_per_step.max(1);
-        let inv_m = 1.0 / (m as f32);
-        let mut sum_gf = 0.0f32;
-
-        for _ in 0..m {
-            let y = sample_point_in_ball(rng, x, R);
-            let r = (y - x).length().max(poisson.min_r);
-            let gball = green_ball_3d(R, r);
-            sum_gf += gball * fsrc.value(y);
+        match poisson.sampling {
+            InteriorSampling::Uniform => {
+                // I ≈ Vol(B) * (1/m) Σ G_B(x,Y) f(Y),  Y ~ Uniform(B)
+                let vol = ball_volume(R);
+                let inv_m = 1.0 / (m as f32);
+                let mut sum = 0.0;
+                for _ in 0..m {
+                    let y = sample_point_in_ball(rng, x, R);
+                    let r = (y - x).length().max(poisson.min_r);
+                    let gB = green_ball_3d(R, r);
+                    // For point sources, f.value(y)=0 almost surely, which is fine;
+                    // the analytic kick above already handled the δ contribution.
+                    sum += gB * fsrc.value(y);
+                }
+                acc += vol * (sum * inv_m);
+            }
+            InteriorSampling::GreenBall => {
+                // With p(y) ∝ G_B, the integral becomes Z * E[f(Y)] with Z = R^2/6.
+                // This eliminates the G_B factor from the MC sum (nice variance cut).
+                let Z = green_ball_integral_z(R);
+                let inv_m = 1.0 / (m as f32);
+                let mut sum = 0.0;
+                for _ in 0..m {
+                    let y = sample_point_in_ball_green(rng, x, R);
+                    sum += fsrc.value(y);
+                }
+                acc += Z * (sum * inv_m);
+            }
         }
-        acc += vol * (sum_gf * inv_m);
 
-        // --- WoS jump to the sphere S(x, R)
+        // Step
         x = wos_jump(x, R, rng);
 
         steps += 1;
         if steps >= params.max_steps {
-            // Conservative fallback: sample boundary and return accumulated integral + boundary
             let c = accel.closest(domain, x);
             return acc + g.value(c.point);
         }
     }
 }
 
+/// ### Online mean/variance accumulator (Welford)
+///
+/// Tracks mean and (unbiased) sample variance of a stream of values.
+#[derive(Copy, Clone, Default, Debug)]
+pub struct Stats {
+    n: u32,
+    mean: f32,
+    m2: f32,
+}
+impl Stats {
+    #[inline]
+    pub fn push(&mut self, x: f32) {
+        self.n = self.n.saturating_add(1);
+        let n = self.n as f32;
+        let delta = x - self.mean;
+        self.mean += delta / n;
+        self.m2 += delta * (x - self.mean);
+    }
+    #[inline]
+    pub fn mean(&self) -> f32 {
+        self.mean
+    }
+    /// Unbiased sample variance; returns 0 if n<2.
+    #[inline]
+    pub fn var(&self) -> f32 {
+        if self.n > 1 {
+            self.m2 / ((self.n - 1) as f32)
+        } else {
+            0.0
+        }
+    }
+    #[inline]
+    pub fn count(&self) -> u32 {
+        self.n
+    }
+}
+
 mod tests {
     use crate::*;
+
+    /// Helper: run multiple independent estimates and measure mean/variance.
+    fn estimate_stats<D, A, G, F>(
+        trials: u32,
+        domain: &D,
+        accel: &A,
+        g: &G,
+        fsrc: &F,
+        params: WosParams,
+        poisson: PoissonParams,
+        x: Vec3,
+        seed: u64,
+    ) -> Stats
+    where
+        D: Domain,
+        A: ClosestAccel<D>,
+        G: BoundaryDirichlet,
+        F: SourceTerm,
+    {
+        let mut stats = Stats::default();
+        let mut rng = rng::Rng::seed_from(seed);
+        for _ in 0..trials {
+            let u = wos_poisson_dirichlet(domain, accel, g, fsrc, params, poisson, &mut rng, x);
+            stats.push(u);
+        }
+        stats
+    }
 
     #[test]
     fn laplacian_dirichlet_smoke() {
@@ -1317,5 +1484,133 @@ mod tests {
             (u_lap - u_pois).abs() < 5e-2,
             "Poisson(f=0) should match Laplace"
         );
+    }
+
+    /// Variance reduction: Green-ball IS vs Uniform for constant source.
+    /// Setup:
+    ///   -Ω = unit ball, g=0,  -Δu = 1  =>  u(r) = (1 - r^2)/6,  u(0)=1/6.
+    /// Green-ball IS turns each ball's interior estimate into Z * mean(f)=Z exactly per step
+    /// (for f≡1), so it removes interior sampling noise; only path randomness remains.
+    #[test]
+    fn variance_reduction_greenball_vs_uniform() {
+        let domain = SdfDomain::new(|p: Vec3| p.length() - 1.0);
+        let g0 = BoundaryDirichletFn::new(|_p| 0.0);
+
+        struct One;
+        impl SourceTerm for One {
+            fn value(&self, _x: Vec3) -> f32 {
+                1.0
+            }
+        }
+        let fsrc = One;
+
+        let params = WosParams::new(1e-4, 50_000);
+        let x0 = Vec3::new(0.2, 0.0, 0.0);
+
+        // Keep interior_samples_per_step small to highlight per-step variance effects
+        let uni = PoissonParams::new(1).with_sampling(InteriorSampling::Uniform);
+        let grn = PoissonParams::new(1).with_sampling(InteriorSampling::GreenBall);
+
+        let trials = 400; // modest but illustrative
+        let s_uni = estimate_stats(
+            trials,
+            &domain,
+            &ClosestNaive,
+            &g0,
+            &fsrc,
+            params,
+            uni,
+            x0,
+            777,
+        );
+        let s_grn = estimate_stats(
+            trials,
+            &domain,
+            &ClosestNaive,
+            &g0,
+            &fsrc,
+            params,
+            grn,
+            x0,
+            888,
+        );
+
+        // Both unbiased; check means near truth
+        let exact = (1.0 - x0.length_sq()) / 6.0;
+        assert!(
+            (s_uni.mean() - exact).abs() < 0.08,
+            "uniform mean off: {} vs {}",
+            s_uni.mean(),
+            exact
+        );
+        assert!(
+            (s_grn.mean() - exact).abs() < 0.08,
+            "green mean off: {} vs {}",
+            s_grn.mean(),
+            exact
+        );
+
+        // Variance reduction: should be strictly lower with Green-ball IS
+        // Leave some slack: stochastic—just ensure it's noticeably smaller.
+        assert!(
+            s_grn.var() < s_uni.var() * 0.8,
+            "expected variance drop; got uni={}, green={}",
+            s_uni.var(),
+            s_grn.var()
+        );
+    }
+
+    #[test]
+    fn point_source_analytic_kick_is_unbiased_in_unit_ball() {
+        use crate::*;
+
+        // Domain: unit ball via SDF
+        let ball = SdfDomain::new(|p: Vec3| p.length() - 1.0);
+
+        // Dirichlet: g ≡ 0
+        let g0 = BoundaryDirichletFn::new(|_| 0.0);
+
+        // Point source at z (not at x to avoid min_r clamp dominating); strength q
+        let z = Vec3::new(0.25, 0.0, 0.0);
+        let q = 1.0;
+
+        struct PointSrc {
+            z: Vec3,
+            q: f32,
+        }
+        impl SourceTerm for PointSrc {
+            fn value(&self, _x: Vec3) -> f32 {
+                0.0
+            } // δ cannot be point-sampled
+            fn point_params(&self) -> Option<(Vec3, f32)> {
+                Some((self.z, self.q))
+            }
+        }
+        let fsrc = PointSrc { z, q };
+
+        // WoS configuration
+        let params = WosParams::new(1e-4, 10_000);
+        let poisson = PoissonParams::new(1);
+        let mut rng = rng::Rng::seed_from(123);
+
+        // Evaluate at x = 0
+        let x = Vec3::new(0.0, 0.0, 0.0);
+        let u = wos_poisson_dirichlet(
+            &ball,
+            &ClosestNaive,
+            &g0,
+            &fsrc,
+            params,
+            poisson,
+            &mut rng,
+            x,
+        );
+
+        // Exact Green of unit ball at center:
+        // G(0,z) = (1/(4π)) (1/|z| - 1)
+        let r = (z - x).length().max(1e-7);
+        let exact = (1.0 / (4.0 * core::f32::consts::PI)) * (1.0 / r - 1.0) * q;
+
+        assert!((u - exact).abs() < 1e-4, "u = {u}, exact = {exact}");
     }
 }
