@@ -956,51 +956,40 @@ impl WosParams {
     }
 }
 
-/// CDF for t=r/R under Green-ball pdf: F(t)=3 t^2 - 2 t^3.
-/// We invert with a few Newton steps; 3 iterations are plenty.
-#[inline]
-fn inv_cdf_green_ball(u: f32) -> f32 {
-    // Clamp u to (0,1)
-    let mut t = u.min(1.0 - 1e-7).max(1e-7); // initial guess
-    // Newton: solve F(t) - u = 0 ; F'(t)=6t - 6t^2
+/// Inverse CDF for t = r/R under the 3D “Green-ball” radius pdf.
+/// F(t) = 3 t^2 - 2 t^3,  t ∈ (0,1).
+fn inv_cdf_radius_under_green_pdf(u: f32) -> f32 {
+    // Clamp u to (0,1) and do a few Newton steps; 3 steps are plenty.
+    let mut t = u.min(1.0 - 1e-7).max(1e-7);
     for _ in 0..3 {
         let f = 3.0 * t * t - 2.0 * t * t * t - u;
         let df = 6.0 * t - 6.0 * t * t;
-        // Guard against df≈0 at t≈0 or t≈1
         let step = if df.abs() > 1e-6 { f / df } else { 0.0 };
-        t = (t - step).min(1.0 - 1e-7).max(1e-7);
+        t = (t - step).min(1.0 - 1e-7).max(1.0e-7);
     }
     t
 }
 
-/// Sample Y in B(center,R) with pdf p(y) ∝ G_B^{3D}(x,y).
+/// Draw Y ∈ B(center,R) with pdf p(y) ∝ G_B^{3D}(x,y) (Green-ball importance sampling).
 #[inline]
-fn sample_point_in_ball_green(rng: &mut Rng, center: Vec3, radius: f32) -> Vec3 {
+fn sample_ball_by_green_pdf(rng: &mut Rng, center: Vec3, radius: f32) -> Vec3 {
     let dir = sample_unit_sphere(rng); // uniform direction
-    let u = rng.uniform_f32().max(1e-7); // for radius via inverse CDF
-    let t = inv_cdf_green_ball(u); // t in (0,1)
-    let r = radius * t;
-    center + dir * r
+    let u = rng.uniform_f32().max(1e-7); // radius via inverse CDF
+    let t = inv_cdf_radius_under_green_pdf(u);
+    center + dir * (radius * t)
 }
 
+/// Total mass of the (Dirichlet) Green's function over a ball:  ∫_B G_B^3D(x,y) dy = R²/6.
 #[inline]
-fn green_ball_integral_z(radius: f32) -> f32 {
-    // Z = ∫_B G d y
-    // From Appendix A: |G_B^3D(x)| = R^2 / 6
+fn green_ball_total_mass(radius: f32) -> f32 {
     (radius * radius) / 6.0
 }
 
-/// ### Uniform sampling in a 3D ball
-///
-/// Draws `Y ~ Uniform(B(x, R))`. Used for Monte Carlo estimation of the domain integral
-/// in Poisson problems via importance sampling with a uniform pdf.
-/// (pdf = 1 / Vol(B), where Vol(B) = 4/3 π R³)
+/// Draw Y ∈ B(center,R) uniformly (volume pdf).
 #[inline]
-fn sample_point_in_ball(rng: &mut Rng, center: Vec3, radius: f32) -> Vec3 {
-    // Sample direction on S²
-    let dir = sample_unit_sphere(rng);
-    // Radius with correct volume pdf: r = R * u^(1/3)
-    let u = rng.uniform_f32().max(1e-7);
+fn sample_ball_uniform(rng: &mut Rng, center: Vec3, radius: f32) -> Vec3 {
+    let dir = sample_unit_sphere(rng); // S²
+    let u = rng.uniform_f32().max(1e-7); // radius ~ R * u^(1/3)
     center + dir * (radius * powf(u, 1.0 / 3.0))
 }
 
@@ -1277,7 +1266,7 @@ where
                 let inv_m = 1.0 / (m as f32);
                 let mut sum = 0.0;
                 for _ in 0..m {
-                    let y = sample_point_in_ball(rng, x, R);
+                    let y = sample_ball_uniform(rng, x, R);
                     let r = (y - x).length().max(poisson.min_r);
                     let gB = green_ball_3d(R, r);
                     // For point sources, f.value(y)=0 almost surely, which is fine;
@@ -1289,11 +1278,11 @@ where
             InteriorSampling::GreenBall => {
                 // With p(y) ∝ G_B, the integral becomes Z * E[f(Y)] with Z = R^2/6.
                 // This eliminates the G_B factor from the MC sum (nice variance cut).
-                let Z = green_ball_integral_z(R);
+                let Z = green_ball_total_mass(R);
                 let inv_m = 1.0 / (m as f32);
                 let mut sum = 0.0;
                 for _ in 0..m {
-                    let y = sample_point_in_ball_green(rng, x, R);
+                    let y = sample_ball_by_green_pdf(rng, x, R);
                     sum += fsrc.value(y);
                 }
                 acc += Z * (sum * inv_m);
@@ -1348,11 +1337,12 @@ impl Stats {
     }
 }
 
+#[cfg(test)]
 mod tests {
     use crate::*;
 
-    /// Helper: run multiple independent estimates and measure mean/variance.
-    fn estimate_stats<D, A, G, F>(
+    /// Run many **Poisson** single-path estimates of u(x) and return Welford stats.
+    fn poisson_repeat_and_stats<D, A, G, F>(
         trials: u32,
         domain: &D,
         accel: &A,
@@ -1512,7 +1502,7 @@ mod tests {
         let grn = PoissonParams::new(1).with_sampling(InteriorSampling::GreenBall);
 
         let trials = 400; // modest but illustrative
-        let s_uni = estimate_stats(
+        let s_uni = poisson_repeat_and_stats(
             trials,
             &domain,
             &ClosestNaive,
@@ -1523,7 +1513,7 @@ mod tests {
             x0,
             777,
         );
-        let s_grn = estimate_stats(
+        let s_grn = poisson_repeat_and_stats(
             trials,
             &domain,
             &ClosestNaive,
@@ -1573,20 +1563,10 @@ mod tests {
         // Point source at z (not at x to avoid min_r clamp dominating); strength q
         let z = Vec3::new(0.25, 0.0, 0.0);
         let q = 1.0;
-
-        struct PointSrc {
-            z: Vec3,
-            q: f32,
-        }
-        impl SourceTerm for PointSrc {
-            fn value(&self, _x: Vec3) -> f32 {
-                0.0
-            } // δ cannot be point-sampled
-            fn point_params(&self) -> Option<(Vec3, f32)> {
-                Some((self.z, self.q))
-            }
-        }
-        let fsrc = PointSrc { z, q };
+        let fsrc = PointSource {
+            position: z,
+            strength: q,
+        };
 
         // WoS configuration
         let params = WosParams::new(1e-4, 10_000);
