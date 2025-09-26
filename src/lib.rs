@@ -1329,6 +1329,36 @@ impl GradParams {
     }
 }
 
+/// Generic single-ball surface-term gradient estimator:
+/// returns (3/R) * E[ U(x+R ξ) * ξ ], where U is "how to evaluate u(·)".
+fn grad_surface_single_ball<D, A, Ueval>(
+    domain: &D,
+    accel: &A,
+    eval_u: &mut Ueval,
+    walk: WosParams,
+    boundary_dirs: u32,
+    min_r: f32,
+    rng: &mut Rng,
+    x: Vec3,
+) -> Vec3
+where
+    D: Domain,
+    A: ClosestAccel<D>,
+    Ueval: FnMut(&D, &A, WosParams, &mut Rng, Vec3) -> f32,
+{
+    let c = accel.closest(domain, x);
+    let R = (c.distance).max(min_r);
+    let m = boundary_dirs.max(1);
+    let mut acc = Vec3::new(0.0, 0.0, 0.0);
+    for _ in 0..m {
+        let xi = sample_unit_sphere(rng);
+        let xp = x + xi * R;
+        let up = eval_u(domain, accel, walk, rng, xp);
+        acc += xi * up;
+    }
+    acc * (3.0 / (R * m as f32))
+}
+
 /// ### Gradient of the Laplace–Dirichlet solution via a single-ball estimator.
 ///
 /// Uses the identity  ∇u(x) = (3/R) E[ u(x+R ξ) ξ ],  valid when u is harmonic in B(x,R).
@@ -1350,22 +1380,99 @@ where
     A: ClosestAccel<D>,
     G: BoundaryDirichlet,
 {
-    // Largest empty ball at x
+    let mut eval_u = |d: &D, a: &A, w: WosParams, r: &mut Rng, xp: Vec3| {
+        wos_laplace_dirichlet(d, a, g, w, r, xp)
+    };
+    grad_surface_single_ball(
+        domain,
+        accel,
+        &mut eval_u,
+        walk,
+        grad.boundary_dirs,
+        grad.min_r,
+        rng,
+        x,
+    )
+}
+
+/// ### Gradient of the Poisson–Dirichlet solution in 3D via a single-ball estimator.
+///
+/// We estimate:
+/// - surface term by sampling directions ξ and *continuing* Poisson WoS from x+Rξ;
+/// - volume term by MC over the ball using either uniform or Green-ball IS.
+pub fn grad_poisson_dirichlet_wos<D, A, G, F>(
+    domain: &D,
+    accel: &A,
+    g: &G,
+    fsrc: &F,
+    walk: WosParams,
+    pois: PoissonParams,
+    grad: GradParams,
+    rng: &mut Rng,
+    x: Vec3,
+) -> Vec3
+where
+    D: Domain,
+    A: ClosestAccel<D>,
+    G: BoundaryDirichlet,
+    F: SourceTerm,
+{
+    // Ball at x
     let c = accel.closest(domain, x);
     let R = c.distance.max(grad.min_r);
 
-    // Sum (3/R) * u(x+Rξ) * ξ over ξ ~ Unif(S²)
-    let m = grad.boundary_dirs;
-    let scale = 3.0 / R;
-    let mut acc = Vec3::new(0.0, 0.0, 0.0);
+    // Surface term (needs full Poisson u)
+    let mut eval_u = |d: &D, a: &A, w: WosParams, r: &mut Rng, xp: Vec3| {
+        wos_poisson_dirichlet(d, a, g, fsrc, w, pois, r, xp)
+    };
+    let surf = grad_surface_single_ball(
+        domain,
+        accel,
+        &mut eval_u,
+        walk,
+        grad.boundary_dirs,
+        grad.min_r,
+        rng,
+        x,
+    );
 
-    for _ in 0..m {
-        let xi = sample_unit_sphere(rng);
-        let xp = x + xi * R;
-        let up = wos_laplace_dirichlet(domain, accel, g, walk, rng, xp);
-        acc += xi * up;
+    // --- Volume term:  ∫_B ∇_x G f
+    let k = grad.interior_samples.max(1);
+    let mut vol = Vec3::new(0.0, 0.0, 0.0);
+
+    match grad.sampling {
+        InteriorSampling::Uniform => {
+            // I ≈ Vol(B) * (1/k) Σ [ ∇_x G(x, Y_i) f(Y_i) ], Y_i ~ Unif(B)
+            let volB = ball_volume(R);
+            let mut sum = Vec3::new(0.0, 0.0, 0.0);
+            for _ in 0..k {
+                let y = sample_ball_uniform(rng, x, R);
+                let r = (x - y).length().max(grad.min_r);
+                let gradG = (x - y) * (-1.0 / (4.0 * PI * r * r * r)); // -(x-y)/4π r^3
+                sum += gradG * fsrc.value(y);
+            }
+            vol = sum * (volB / k as f32);
+        }
+        InteriorSampling::GreenBall => {
+            // p(y) ∝ G(x,y) (with total mass Z = R²/6)
+            // ∫ ∇G f = E_p[ (∇G / p) f ] = Z * E_p[ (∇G / G) f ]
+            let Z = green_ball_total_mass(R);
+            let mut sum = Vec3::new(0.0, 0.0, 0.0);
+            for _ in 0..k {
+                let y = sample_ball_by_green_pdf(rng, x, R);
+                let r = (x - y).length().max(grad.min_r);
+                let G = (1.0 / (4.0 * PI)) * (1.0 / r - 1.0 / R).max(1e-12);
+                let gradG = (x - y) * (-1.0 / (4.0 * PI * r * r * r));
+                // weight = Z * (gradG / G)
+                let w = Z / G;
+                sum += gradG * (w * fsrc.value(y));
+            }
+            vol = sum * (1.0 / k as f32);
+        }
     }
-    acc * (scale / m as f32)
+
+    // ∇u = surface − volume
+    surf - vol
 }
 
 /// ### Online mean/variance accumulator (Welford)
@@ -1684,6 +1791,51 @@ mod tests {
         assert!(
             err < 0.1,
             "Laplace grad error too large: got {g_est:?}, want {g_true:?}, |err|={err}"
+        );
+    }
+
+    #[test]
+    fn grad_poisson_constant_source_matches_analytic() {
+        let ball = SdfDomain::new(|p: Vec3| p.length() - 1.0);
+        let g0 = BoundaryDirichletFn::new(|_| 0.0);
+        struct One;
+        impl SourceTerm for One {
+            fn value(&self, _x: Vec3) -> f32 {
+                1.0
+            }
+        }
+        let fsrc = One;
+
+        let walk = WosParams::new(1e-4, 60_000);
+        // Keep Poisson scalar estimator variance low (used for surface term evaluation):
+        let pois = PoissonParams::new(4).with_sampling(InteriorSampling::GreenBall);
+        let mut rng = rng::Rng::seed_from(7);
+
+        // interior point
+        let x = Vec3::new(0.25, -0.1, 0.2);
+
+        // More samples for the gradient’s surface+volume terms
+        let grad_cfg = GradParams::new(256, 64).with_sampling(InteriorSampling::GreenBall);
+
+        let g_est = grad_poisson_dirichlet_wos(
+            &ball,
+            &ClosestNaive,
+            &g0,
+            &fsrc,
+            walk,
+            pois,
+            grad_cfg,
+            &mut rng,
+            x,
+        );
+
+        // Analytic: u=(1 - |x|^2)/6 ⇒ ∇u = -(1/3) x
+        let g_true = x * (-1.0 / 3.0);
+        let err = (g_est - g_true).length();
+
+        assert!(
+            err < 0.12,
+            "Poisson grad error too large: got {g_est:?}, want {g_true:?}, |err|={err}"
         );
     }
 }
