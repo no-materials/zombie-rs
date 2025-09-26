@@ -1300,6 +1300,74 @@ where
     }
 }
 
+/// Gradient estimator knobs (used by both Laplace/Poisson).
+#[derive(Copy, Clone, Debug)]
+pub struct GradParams {
+    /// Number of sphere directions ξ per gradient call (surface term).
+    pub boundary_dirs: u32,
+    /// Number of interior samples for the Poisson volume term.
+    pub interior_samples: u32,
+    /// How to sample the Poisson volume term.
+    pub sampling: InteriorSampling,
+    /// Clamp for near-singularity in kernels.
+    pub min_r: f32,
+}
+impl GradParams {
+    pub fn new(boundary_dirs: u32, interior_samples: u32) -> Self {
+        Self {
+            boundary_dirs: boundary_dirs.max(1),
+            interior_samples: interior_samples.max(1),
+            sampling: InteriorSampling::Uniform,
+            min_r: 1e-7,
+        }
+    }
+    pub const fn with_sampling(self, sampling: InteriorSampling) -> Self {
+        Self { sampling, ..self }
+    }
+    pub const fn with_min_r(self, min_r: f32) -> Self {
+        Self { min_r, ..self }
+    }
+}
+
+/// ### Gradient of the Laplace–Dirichlet solution via a single-ball estimator.
+///
+/// Uses the identity  ∇u(x) = (3/R) E[ u(x+R ξ) ξ ],  valid when u is harmonic in B(x,R).
+/// We estimate u(x+R ξ) by *continuing* WoS from that one-step point.
+///
+/// Unbiased in expectation; variance ↓ as you increase `grad.boundary_dirs` (and also by
+/// averaging multiple calls with different seeds, as usual with MC).
+pub fn grad_laplace_dirichlet_wos<D, A, G>(
+    domain: &D,
+    accel: &A,
+    g: &G,
+    walk: WosParams,
+    grad: GradParams,
+    rng: &mut Rng,
+    x: Vec3,
+) -> Vec3
+where
+    D: Domain,
+    A: ClosestAccel<D>,
+    G: BoundaryDirichlet,
+{
+    // Largest empty ball at x
+    let c = accel.closest(domain, x);
+    let R = c.distance.max(grad.min_r);
+
+    // Sum (3/R) * u(x+Rξ) * ξ over ξ ~ Unif(S²)
+    let m = grad.boundary_dirs;
+    let scale = 3.0 / R;
+    let mut acc = Vec3::new(0.0, 0.0, 0.0);
+
+    for _ in 0..m {
+        let xi = sample_unit_sphere(rng);
+        let xp = x + xi * R;
+        let up = wos_laplace_dirichlet(domain, accel, g, walk, rng, xp);
+        acc += xi * up;
+    }
+    acc * (scale / m as f32)
+}
+
 /// ### Online mean/variance accumulator (Welford)
 ///
 /// Tracks mean and (unbiased) sample variance of a stream of values.
@@ -1592,5 +1660,30 @@ mod tests {
         let exact = (1.0 / (4.0 * core::f32::consts::PI)) * (1.0 / r - 1.0) * q;
 
         assert!((u - exact).abs() < 1e-4, "u = {u}, exact = {exact}");
+    }
+
+    #[test]
+    fn grad_laplace_dirichlet_linear_bc_is_constant() {
+        let ball = SdfDomain::new(|p: Vec3| p.length() - 1.0);
+        // g(p)=p.x ⇒ u(x)=x.x inside the ball (harmonic extension), ∇u=(1,0,0).
+        let g_lin = BoundaryDirichletFn::new(|p: Vec3| p.x);
+        let walk = WosParams::new(1e-4, 40_000);
+        let mut rng = rng::Rng::seed_from(2025);
+
+        // interior point
+        let x = Vec3::new(0.2, -0.1, 0.15);
+
+        // A few dozen directions is enough; increase for tighter tolerance.
+        let grad_cfg = GradParams::new(512, 1);
+
+        let g_est =
+            grad_laplace_dirichlet_wos(&ball, &ClosestNaive, &g_lin, walk, grad_cfg, &mut rng, x);
+        let g_true = Vec3::new(1.0, 0.0, 0.0);
+        let err = (g_est - g_true).length();
+
+        assert!(
+            err < 0.1,
+            "Laplace grad error too large: got {g_est:?}, want {g_true:?}, |err|={err}"
+        );
     }
 }
