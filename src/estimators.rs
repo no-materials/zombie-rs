@@ -11,7 +11,9 @@ use crate::accel::ClosestAccel;
 use crate::boundary::BoundaryDirichlet;
 use crate::domain::Domain;
 use crate::math::Vec3;
-use crate::observer::{TerminationReason, WalkObserver, WalkOutcome, WalkStart, WalkStep, WalkTerminate};
+use crate::observer::{
+    TerminationReason, WalkObserver, WalkOutcome, WalkStart, WalkStep, WalkTerminate,
+};
 use crate::params::{GradParams, InteriorSampling, PoissonParams, WalkBudget, WosParams};
 use crate::rng::Rng;
 use crate::sampling::{
@@ -118,7 +120,11 @@ where
                 reason: TerminationReason::HitBoundary,
                 depth: steps,
             });
-            return WalkOutcome::new(acc + g.value(c.point), TerminationReason::HitBoundary, steps);
+            return WalkOutcome::new(
+                acc + g.value(c.point),
+                TerminationReason::HitBoundary,
+                steps,
+            );
         }
 
         observer.on_step(WalkStep {

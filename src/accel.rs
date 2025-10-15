@@ -5,7 +5,7 @@ use core::cmp::Ordering;
 use libm::sqrtf;
 
 use crate::domain::{Closest, Domain, PolygonSoupDomain};
-use crate::math::{closest_point_on_triangle, Aabb, Vec3};
+use crate::math::{Aabb, Vec3, closest_point_on_triangle};
 
 /// A single BVH node.
 /// We store a binary tree with nodes laid out in a flat array for cache locality.

@@ -107,16 +107,7 @@ where
         G: BoundaryDirichlet,
     {
         let observers = self.observer_list();
-        wos_laplace_dirichlet(
-            self.domain,
-            self.accel,
-            g,
-            budget,
-            rng,
-            query,
-            &observers,
-        )
-        .value
+        wos_laplace_dirichlet(self.domain, self.accel, g, budget, rng, query, &observers).value
     }
 
     /// Solve Poisson with Dirichlet data at a query point.

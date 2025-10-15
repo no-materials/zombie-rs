@@ -3,7 +3,7 @@
 use alloc::vec::Vec;
 use libm::sqrtf;
 
-use crate::math::{closest_point_on_triangle, Vec3};
+use crate::math::{Vec3, closest_point_on_triangle};
 
 /// Minimal information needed by WoS to define largest empty ball.
 #[derive(Copy, Clone, Debug)]

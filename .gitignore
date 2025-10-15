@@ -3,3 +3,5 @@ target/
 *.pdf
 
 notes.md
+
+*.ply

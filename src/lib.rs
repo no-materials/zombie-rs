@@ -31,7 +31,10 @@ pub use estimators::{
     wos_poisson_dirichlet,
 };
 pub use math::{Aabb, Vec3, closest_point_on_triangle};
-pub use observer::{NoopObserver, TerminationReason, WalkObserver, WalkOutcome};
+pub use observer::{
+    NoopObserver, PlyRecorder, StatsObserver, TerminationReason, WalkObserver, WalkOutcome,
+    WalkStatsSnapshot,
+};
 pub use params::{GradParams, InteriorSampling, PoissonParams, WalkBudget};
 pub use rng::Rng;
 pub use solver::{Solver, SolverBuilder};
@@ -317,5 +320,34 @@ mod tests {
             err < 0.12,
             "Poisson grad error too large: got {g_est:?}, want {g_true:?}, |err|={err}"
         );
+    }
+
+    #[test]
+    fn observers_capture_walk_data() {
+        let sphere = SdfDomain::new(|p: Vec3| p.length() - 1.0);
+        let accel = ClosestNaive;
+        let stats = StatsObserver::new();
+        let ply = PlyRecorder::new();
+        let solver = Solver::builder(&sphere, &accel)
+            .with_observer(stats.clone())
+            .with_observer(ply.clone())
+            .build();
+
+        let bc = BoundaryDirichletFn::new(|_| 0.0);
+        let mut rng = rng::Rng::seed_from(5);
+        let _ = solver.laplace_dirichlet(
+            &bc,
+            WalkBudget::new(1e-4, 2_000),
+            &mut rng,
+            Vec3::new(0.1, 0.1, 0.1),
+        );
+
+        let snap = stats.snapshot();
+        assert_eq!(snap.walks, 1);
+        assert!(snap.total_steps > 0);
+
+        let ply_text = ply.to_ascii();
+        assert!(ply_text.contains("ply"));
+        assert!(ply_text.contains("vertex"));
     }
 }
