@@ -31,7 +31,7 @@ pub use estimators::{
     wos_poisson_dirichlet,
 };
 pub use math::{Aabb, Vec3, closest_point_on_triangle};
-pub use observer::{TerminationReason, WalkObserver, WalkOutcome};
+pub use observer::{NoopObserver, TerminationReason, WalkObserver, WalkOutcome};
 pub use params::{GradParams, InteriorSampling, PoissonParams, WalkBudget};
 pub use rng::Rng;
 pub use solver::{Solver, SolverBuilder};

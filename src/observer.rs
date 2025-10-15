@@ -75,8 +75,8 @@ pub trait WalkObserver: Send + Sync {
     fn on_terminate(&self, _event: WalkTerminate) {}
 }
 
-/// Observer implementation that does nothing; used when no instrumentation is requested.
-pub(crate) struct NoopObserver;
+/// Observer implementation that does nothing; useful when no instrumentation is requested.
+pub struct NoopObserver;
 
 impl WalkObserver for NoopObserver {}
 

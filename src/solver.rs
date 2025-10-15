@@ -10,8 +10,8 @@ use alloc::vec::Vec;
 use crate::accel::ClosestAccel;
 use crate::boundary::BoundaryDirichlet;
 use crate::estimators::{
-    grad_laplace_dirichlet_wos, grad_poisson_dirichlet_wos, wos_laplace_dirichlet_with_observer,
-    wos_poisson_dirichlet_with_observer,
+    grad_laplace_dirichlet_wos, grad_poisson_dirichlet_wos, wos_laplace_dirichlet,
+    wos_poisson_dirichlet,
 };
 use crate::math::Vec3;
 use crate::observer::{ObserverList, WalkObserver};
@@ -106,13 +106,12 @@ where
     where
         G: BoundaryDirichlet,
     {
-        let params = budget.to_wos();
         let observers = self.observer_list();
-        wos_laplace_dirichlet_with_observer(
+        wos_laplace_dirichlet(
             self.domain,
             self.accel,
             g,
-            params,
+            budget,
             rng,
             query,
             &observers,
@@ -134,14 +133,13 @@ where
         G: BoundaryDirichlet,
         F: SourceTerm,
     {
-        let params = walk.to_wos();
         let observers = self.observer_list();
-        wos_poisson_dirichlet_with_observer(
+        wos_poisson_dirichlet(
             self.domain,
             self.accel,
             g,
             fsrc,
-            params,
+            walk,
             poisson,
             rng,
             query,
@@ -150,7 +148,7 @@ where
         .value
     }
 
-    /// Estimate the Laplace gradient using shared observers.
+    /// Estimate the Laplace gradient; observer callbacks fire for the continuation walks.
     pub fn laplace_gradient<G>(
         &self,
         g: &G,
@@ -162,10 +160,20 @@ where
     where
         G: BoundaryDirichlet,
     {
-        grad_laplace_dirichlet_wos(self.domain, self.accel, g, walk, grad, rng, query)
+        let observers = self.observer_list();
+        grad_laplace_dirichlet_wos(
+            self.domain,
+            self.accel,
+            g,
+            walk,
+            &observers,
+            grad,
+            rng,
+            query,
+        )
     }
 
-    /// Estimate the Poisson gradient using shared observers.
+    /// Estimate the Poisson gradient; observer callbacks fire for the continuation walks.
     pub fn poisson_gradient<G, F>(
         &self,
         g: &G,
@@ -180,12 +188,14 @@ where
         G: BoundaryDirichlet,
         F: SourceTerm,
     {
+        let observers = self.observer_list();
         grad_poisson_dirichlet_wos(
             self.domain,
             self.accel,
             g,
             fsrc,
             walk,
+            &observers,
             poisson,
             grad,
             rng,

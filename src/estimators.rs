@@ -11,9 +11,7 @@ use crate::accel::ClosestAccel;
 use crate::boundary::BoundaryDirichlet;
 use crate::domain::Domain;
 use crate::math::Vec3;
-use crate::observer::{
-    NoopObserver, TerminationReason, WalkObserver, WalkOutcome, WalkStart, WalkStep, WalkTerminate,
-};
+use crate::observer::{TerminationReason, WalkObserver, WalkOutcome, WalkStart, WalkStep, WalkTerminate};
 use crate::params::{GradParams, InteriorSampling, PoissonParams, WalkBudget, WosParams};
 use crate::rng::Rng;
 use crate::sampling::{
@@ -22,12 +20,12 @@ use crate::sampling::{
 };
 use crate::source::SourceTerm;
 
-/// Walk-on-Spheres Laplace estimator with observer hook.
-pub(crate) fn wos_laplace_dirichlet_with_observer<D, G, A, O>(
+/// Walk-on-Spheres Laplace estimator returning both the value and termination metadata.
+pub fn wos_laplace_dirichlet<D, G, A, O>(
     domain: &D,
     accel: &A,
     g: &G,
-    params: WosParams,
+    budget: WalkBudget,
     rng: &mut Rng,
     mut x: Vec3,
     observer: &O,
@@ -38,6 +36,7 @@ where
     G: BoundaryDirichlet,
     O: WalkObserver,
 {
+    let params: WosParams = budget.into();
     let mut steps = 0u32;
     debug_assert!(
         domain.is_inside(x),
@@ -76,28 +75,13 @@ where
     }
 }
 
-/// Unbiased estimator of the harmonic function `u` with boundary data `g` on `∂Ω`.
-///
-/// See: paper §2.2 (Walk on Spheres), §6.1 (stopping tolerance).
-pub fn wos_laplace_dirichlet<D: Domain, G: BoundaryDirichlet>(
-    domain: &D,
-    accel: &impl ClosestAccel<D>,
-    g: &G,
-    budget: WalkBudget,
-    rng: &mut Rng,
-    x: Vec3,
-) -> f32 {
-    let params: WosParams = budget.into();
-    wos_laplace_dirichlet_with_observer(domain, accel, g, params, rng, x, &NoopObserver).value
-}
-
-/// Poisson (Dirichlet) estimator via Walk-on-Spheres + ball Green function.
-pub(crate) fn wos_poisson_dirichlet_with_observer<D, A, G, F, O>(
+/// Poisson (Dirichlet) estimator via Walk-on-Spheres + ball Green function, including metadata.
+pub fn wos_poisson_dirichlet<D, A, G, F, O>(
     domain: &D,
     accel: &A,
     g: &G,
     fsrc: &F,
-    params: WosParams,
+    budget: WalkBudget,
     poisson: PoissonParams,
     rng: &mut Rng,
     mut x: Vec3,
@@ -115,6 +99,7 @@ where
         "wos_poisson_dirichlet: x must be inside Ω"
     );
 
+    let params: WosParams = budget.into();
     let mut steps = 0u32;
     let mut acc = 0.0_f32;
 
@@ -200,43 +185,13 @@ where
     }
 }
 
-/// Solves the **3D** Poisson problem with Dirichlet boundary data `g`.
-pub fn wos_poisson_dirichlet<D, G, F>(
-    domain: &D,
-    accel: &impl ClosestAccel<D>,
-    g: &G,
-    fsrc: &F,
-    budget: WalkBudget,
-    poisson: PoissonParams,
-    rng: &mut Rng,
-    x: Vec3,
-) -> f32
-where
-    D: Domain,
-    G: BoundaryDirichlet,
-    F: SourceTerm,
-{
-    let params: WosParams = budget.into();
-    wos_poisson_dirichlet_with_observer(
-        domain,
-        accel,
-        g,
-        fsrc,
-        params,
-        poisson,
-        rng,
-        x,
-        &NoopObserver,
-    )
-    .value
-}
-
 /// Generic single-ball surface-term gradient estimator:
 /// returns (3/R) * E[ U(x+R ξ) * ξ ], where U is "how to evaluate u(·)".
-fn grad_surface_single_ball<D, A, Ueval>(
+fn grad_surface_single_ball<D, A, O, Ueval>(
     domain: &D,
     accel: &A,
     eval_u: &mut Ueval,
+    observer: &O,
     walk: WosParams,
     boundary_dirs: u32,
     min_r: f32,
@@ -246,7 +201,8 @@ fn grad_surface_single_ball<D, A, Ueval>(
 where
     D: Domain,
     A: ClosestAccel<D>,
-    Ueval: FnMut(&D, &A, WosParams, &mut Rng, Vec3) -> f32,
+    O: WalkObserver,
+    Ueval: FnMut(&D, &A, WosParams, &O, &mut Rng, Vec3) -> f32,
 {
     let c = accel.closest(domain, x);
     let radius = (c.distance).max(min_r);
@@ -255,18 +211,21 @@ where
     for _ in 0..m {
         let xi = crate::sampling::sample_unit_sphere(rng);
         let xp = x + xi * radius;
-        let up = eval_u(domain, accel, walk, rng, xp);
+        let up = eval_u(domain, accel, walk, observer, rng, xp);
         acc += xi * up;
     }
     acc * (3.0 / (radius * m as f32))
 }
 
 /// Gradient of the Laplace–Dirichlet solution via a single-ball estimator.
-pub fn grad_laplace_dirichlet_wos<D, A, G>(
+///
+/// Observer callbacks are invoked for the continuation walks sampled during the estimate.
+pub fn grad_laplace_dirichlet_wos<D, A, G, O>(
     domain: &D,
     accel: &A,
     g: &G,
     walk: WalkBudget,
+    observer: &O,
     grad: GradParams,
     rng: &mut Rng,
     x: Vec3,
@@ -275,15 +234,18 @@ where
     D: Domain,
     A: ClosestAccel<D>,
     G: BoundaryDirichlet,
+    O: WalkObserver,
 {
     let walk_params: WosParams = walk.into();
-    let mut eval_u = |d: &D, a: &A, w: WosParams, r: &mut Rng, xp: Vec3| {
-        wos_laplace_dirichlet_with_observer(d, a, g, w, r, xp, &NoopObserver).value
+    let mut eval_u = |d: &D, a: &A, w: WosParams, obs: &O, r: &mut Rng, xp: Vec3| {
+        let budget = WalkBudget::from(w);
+        wos_laplace_dirichlet(d, a, g, budget, r, xp, obs).value
     };
     grad_surface_single_ball(
         domain,
         accel,
         &mut eval_u,
+        observer,
         walk_params,
         grad.boundary_dirs,
         grad.min_r,
@@ -293,12 +255,15 @@ where
 }
 
 /// Gradient of the Poisson–Dirichlet solution in 3D via a single-ball estimator.
-pub fn grad_poisson_dirichlet_wos<D, A, G, F>(
+///
+/// Observer callbacks are invoked for the continuation walks sampled during the estimate.
+pub fn grad_poisson_dirichlet_wos<D, A, G, F, O>(
     domain: &D,
     accel: &A,
     g: &G,
     fsrc: &F,
     walk: WalkBudget,
+    observer: &O,
     pois: PoissonParams,
     grad: GradParams,
     rng: &mut Rng,
@@ -309,6 +274,7 @@ where
     A: ClosestAccel<D>,
     G: BoundaryDirichlet,
     F: SourceTerm,
+    O: WalkObserver,
 {
     // Ball at x
     let c = accel.closest(domain, x);
@@ -316,13 +282,15 @@ where
 
     // Surface term (needs full Poisson u)
     let walk_params: WosParams = walk.into();
-    let mut eval_u = |d: &D, a: &A, w: WosParams, r: &mut Rng, xp: Vec3| {
-        wos_poisson_dirichlet_with_observer(d, a, g, fsrc, w, pois, r, xp, &NoopObserver).value
+    let mut eval_u = |d: &D, a: &A, w: WosParams, obs: &O, r: &mut Rng, xp: Vec3| {
+        let budget = WalkBudget::from(w);
+        wos_poisson_dirichlet(d, a, g, fsrc, budget, pois, r, xp, obs).value
     };
     let surf = grad_surface_single_ball(
         domain,
         accel,
         &mut eval_u,
+        observer,
         walk_params,
         grad.boundary_dirs,
         grad.min_r,
