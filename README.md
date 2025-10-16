@@ -14,10 +14,13 @@ and composability.
   same interface.
 - Stateless solver façade (`Solver`, `WalkBudget`) for ergonomic usage in
   `no_std` environments.
+- ASCII PLY dump format:
+  - vertices list points in walk order,
+  - RGB encodes role (start = cyan, steps = white, boundary hit = green, max-step exit = red).
 
 ## Why Monte Carlo geometry processing?
 
 WoS replaces volumetric grids with random walks in the continuous domain,
 yielding unbiased solutions with controllable variance and trivial
-parallelisation. This crate aims to provide a Rust-first, safe foundation for
+parallelisation. This workspace provides a Rust-first, safe foundation for
 research and application-level experimentation.

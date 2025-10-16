@@ -1,12 +1,10 @@
-[package]
-name = "monte-carlo-geometry-kernel"
-publish = false
+[workspace]
+resolver = "2"
+members = [
+    "crates/zombie_rs",
+    "crates/walk_viewer",
+]
+
+[workspace.package]
 edition = "2024"
-
-[lib]
-name = "zombie_rs"
-path = "src/lib.rs"
-
-[dependencies]
-libm = "0.2"
-spin = "0.10"
+license = "MIT OR Apache-2.0"

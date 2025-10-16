@@ -1,0 +1,12 @@
+[package]
+name = "zombie_rs"
+publish = false
+edition = "2024"
+description = "Grid-free Monte Carlo geometry processing kernel"
+
+[lib]
+path = "src/lib.rs"
+
+[dependencies]
+libm = "0.2"
+spin = "0.10"
