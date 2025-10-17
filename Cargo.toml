@@ -3,6 +3,7 @@ resolver = "2"
 members = [
     "crates/zombie_rs",
     "crates/walk_viewer",
+    "crates/heat_probe",
 ]
 
 [workspace.package]

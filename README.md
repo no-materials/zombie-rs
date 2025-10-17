@@ -14,9 +14,22 @@ and composability.
   same interface.
 - Stateless solver façade (`Solver`, `WalkBudget`) for ergonomic usage in
   `no_std` environments.
-- ASCII PLY dump format:
-  - vertices list points in walk order,
-  - RGB encodes role (start = cyan, steps = white, boundary hit = green, max-step exit = red).
+- ASCII PLY dump format: vertices in walk order, RGB encodes role (start = cyan,
+  steps = white, boundary hit = green, max-step exit = red).
+
+## Workspace layout
+
+- `crates/zombie_rs/` — core library modules and examples.
+- `crates/heat_probe/` — PNG heat-probe generator.
+- `crates/walk_viewer/` — viewer for walk dumps.
+
+## Quick start
+
+```bash
+cargo run -p heat_probe -- output.png 0.0 64 64
+# Usage: cargo run -p heat_probe -- <output.png> [slice_z] [grid] [samples]
+```
+`heat_probe` generates a PNG heatmap for the requested slice.
 
 ## Why Monte Carlo geometry processing?
 

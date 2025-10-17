@@ -1,0 +1,9 @@
+[package]
+name = "heat_probe"
+publish = false
+edition = "2024"
+description = "Heat-map probe tool for zombie_rs"
+
+[dependencies]
+zombie_rs = { path = "../zombie_rs" }
+image = { version = "0.24", default-features = false, features = ["png"] }
