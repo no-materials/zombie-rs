@@ -6,6 +6,8 @@ use libm::{cosf, powf, sinf, sqrtf};
 use crate::math::Vec3;
 use crate::rng::Rng;
 
+const INV_4PI: f32 = 0.079_577_47;
+
 /// Uniform sampling on the unit sphere (S²)
 ///
 /// Uses a branch-free method based on two uniforms.
@@ -65,8 +67,8 @@ pub(crate) fn ball_volume(radius: f32) -> f32 {
 /// - Singular at r=0, but this happens with probability zero for continuous sampling; we clamp.
 #[inline]
 pub(crate) fn green_ball_3d(radius: f32, r: f32) -> f32 {
-    let r = r.max(1e-7);
-    (1.0 / (4.0 * PI)) * (1.0 / r - 1.0 / radius)
+    let rinv = 1.0 / r.max(1e-7);
+    INV_4PI * (rinv - 1.0 / radius)
 }
 
 /// Total mass of the (Dirichlet) Green's function over a ball:  ∫_B G_B^3D(x,y) dy = R²/6.
