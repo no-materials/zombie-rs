@@ -60,7 +60,7 @@ pub(crate) fn ball_volume(radius: f32) -> f32 {
 /// Dirichlet Green's function on a ball in 3D
 ///
 /// Green_B(x,y) for a ball B(x,R) centered at `x` with radius `R`, evaluated at distance `r=|y-x|`.
-/// See Sawhney & Crane (2020), Appendix A (also reproduced in the WoSt paper):
+/// See Sawhney & Crane (2020), Appendix A (also reproduced in the WoSt paper: Appendix A: Eq. 26):
 /// G_B^3D(x,y) = (1 / 4π) * (1/r - 1/R), for 0 < r <= R.
 ///
 /// Notes:
@@ -71,9 +71,11 @@ pub(crate) fn green_ball_3d(radius: f32, r: f32) -> f32 {
     INV_4PI * (rinv - 1.0 / radius)
 }
 
-/// Total mass of the (Dirichlet) Green's function over a ball:  ∫_B G_B^3D(x,y) dy = R²/6.
+/// Total mass of the (Dirichlet) Green's function over a ball in 3d:  ∫_B G_B^3D(x,y) dy = R²/6.
+///
+/// Wost paper: Appendix A, Eq. 28.
 #[inline]
-pub(crate) fn green_ball_total_mass(radius: f32) -> f32 {
+pub(crate) fn green_ball_3d_total_mass(radius: f32) -> f32 {
     (radius * radius) / 6.0
 }
 

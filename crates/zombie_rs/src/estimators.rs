@@ -17,7 +17,7 @@ use crate::observer::{
 use crate::params::{GradParams, InteriorSampling, PoissonParams, WalkBudget, WosParams};
 use crate::rng::Rng;
 use crate::sampling::{
-    ball_volume, green_ball_3d, green_ball_total_mass, sample_ball_by_green_pdf,
+    ball_volume, green_ball_3d, green_ball_3d_total_mass, sample_ball_by_green_pdf,
     sample_ball_uniform, wos_jump,
 };
 use crate::source::SourceTerm;
@@ -164,7 +164,7 @@ where
             InteriorSampling::GreenBall => {
                 // With p(y) ∝ G_B, the integral becomes Z * E[f(Y)] with Z = R^2/6.
                 // This eliminates the G_B factor from the MC sum (nice variance cut).
-                let z_mass = green_ball_total_mass(radius);
+                let z_mass = green_ball_3d_total_mass(radius);
                 let inv_m = 1.0 / (m as f32);
                 let mut sum = 0.0;
                 for _ in 0..m {
@@ -322,7 +322,7 @@ where
         InteriorSampling::GreenBall => {
             // p(y) ∝ G(x,y) (with total mass Z = R²/6)
             // ∫ ∇G f = E_p[ (∇G / p) f ] = Z * E_p[ (∇G / G) f ]
-            let z_mass = green_ball_total_mass(radius);
+            let z_mass = green_ball_3d_total_mass(radius);
             let mut sum = Vec3::new(0.0, 0.0, 0.0);
             for _ in 0..k {
                 let y = sample_ball_by_green_pdf(rng, x, radius);
