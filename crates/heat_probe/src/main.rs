@@ -1,156 +1,486 @@
-//! Heat-map probe tool for `zombie_rs` using the unit sphere domain.
-//! Evaluate a 2D slice of the harmonic solution and export it as a PNG.
+#![cfg_attr(not(debug_assertions), warn(missing_docs))]
+#![allow(clippy::needless_late_init)] // retained for clarity in GUI update logic
+
+//! Interactive heat-probe viewer built on top of the `zombie_rs` kernel.
 //!
-//! Usage:
-//! ```text
-//! cargo run -p heat_probe -- <output.png> [slice_z] [grid] [samples_per_pixel]
-//! ```
-//! - `slice_z` (default `0.0`): constant z-plane in `[-1, 1]`.
-//! - `grid` (default `64`): resolution of the square heatmap.
-//! - `samples_per_pixel` (default `64`): number of Monte Carlo evaluations per pixel.
+//! This binary renders a 2D slice of the harmonic solution inside the unit
+//! sphere and displays it in an `egui`+`eframe` window. A background worker
+//! thread performs progressive Monte Carlo estimation, while the UI thread
+//! visualises the accumulating samples and exposes live controls for the most
+//! important estimator parameters.
 
-use std::error::Error;
-use std::path::PathBuf;
+use std::sync::mpsc::{self, Receiver, Sender};
+use std::sync::{Arc, Mutex, TryLockError};
+use std::thread;
 
-use image::{ImageBuffer, Rgb};
+use eframe::egui::{
+    self, Color32, ColorImage, Context, Slider, TextureHandle, TextureOptions, Vec2,
+};
+use eframe::{App, CreationContext, Frame, NativeOptions};
 use zombie_rs::{
     BoundaryDirichletFn, ClosestNaive, Domain, Rng, SdfDomain, Solver, Vec3, WalkBudget,
 };
 
-fn main() -> Result<(), Box<dyn Error>> {
-    let config = Config::parse()?;
-    let heatmap = evaluate_slice(&config)?;
-    save_heatmap(&heatmap, &config.output_path, config.grid)?;
-    println!(
-        "Saved heat probe: {} (z = {}, grid = {}, samples = {})",
-        config.output_path.display(),
-        config.slice_z,
-        config.grid,
-        config.samples_per_pixel
-    );
-    Ok(())
-}
-
-/// Runtime configuration parsed from CLI arguments.
-struct Config {
-    output_path: PathBuf,
+/// Runtime parameters that govern how the worker evaluates the heat probe.
+#[derive(Clone, Debug)]
+struct ProbeParams {
+    /// Constant z-slice in the unit ball.
     slice_z: f32,
+    /// Number of pixels along one axis (image resolution is `grid × grid`).
     grid: u32,
-    samples_per_pixel: u32,
+    /// New Monte Carlo samples gathered per pixel in each worker pass.
+    samples_per_pass: u32,
+    /// Walk-on-Spheres termination threshold.
     epsilon: f32,
+    /// Walk-on-Spheres maximum steps safeguard.
     max_steps: u32,
 }
 
-impl Config {
-    fn parse() -> Result<Self, Box<dyn Error>> {
-        let mut args = std::env::args().skip(1);
-        let output = args
-            .next()
-            .ok_or("Usage: cargo run -p heat_probe -- <output.png> [slice_z] [grid] [samples]")?;
-        let slice_z = args
-            .next()
-            .map(|v| v.parse::<f32>().map_err(|_| "Invalid slice_z"))
-            .transpose()?
-            .unwrap_or(0.0);
-        let grid = args
-            .next()
-            .map(|v| v.parse::<u32>().map_err(|_| "Invalid grid size"))
-            .transpose()?
-            .unwrap_or(64);
-        let samples = args
-            .next()
-            .map(|v| v.parse::<u32>().map_err(|_| "Invalid sample count"))
-            .transpose()?
-            .unwrap_or(64);
-        Ok(Self {
-            output_path: PathBuf::from(output),
-            slice_z: slice_z.clamp(-1.0, 1.0),
-            grid: grid.max(1),
-            samples_per_pixel: samples.max(1),
+impl Default for ProbeParams {
+    fn default() -> Self {
+        Self {
+            slice_z: 0.0,
+            grid: 128,
+            samples_per_pass: 4,
             epsilon: 1e-3,
-            max_steps: 5_000,
-        })
+            max_steps: 10_000,
+        }
     }
 }
 
-/// Evaluate the WoS solution over a 2D grid slice.
-fn evaluate_slice(config: &Config) -> Result<Vec<Option<f32>>, Box<dyn Error>> {
-    let domain = SdfDomain::new(|p: Vec3| p.length() - 1.0);
-    let accel = ClosestNaive;
-    let solver = Solver::builder(&domain, &accel).build();
-    let bc = BoundaryDirichletFn::new(|p: Vec3| p.x + p.y + p.z);
-    let walk = WalkBudget::new(config.epsilon, config.max_steps);
+/// Commands issued by the UI to the worker thread.
+#[derive(Debug)]
+enum WorkerCommand {
+    /// Replace the current configuration and clear accumulated samples.
+    Configure(ProbeParams),
+    /// Terminate the worker loop.
+    Exit,
+}
 
-    let grid = config.grid as usize;
-    let half = 1.0f32;
-    let step = (half * 2.0) / grid as f32;
-    let mut values = Vec::with_capacity(grid * grid);
+/// Notifications emitted by the worker once fresh samples are ready.
+#[derive(Debug)]
+enum ProgressEvent {
+    /// New data has been written to the accumulation buffer.
+    FrameReady,
+}
 
-    for j in 0..grid {
-        for i in 0..grid {
-            let x = -half + (i as f32 + 0.5) * step;
-            let y = -half + (j as f32 + 0.5) * step;
-            let position = Vec3::new(x, y, config.slice_z);
-            if !domain.is_inside(position) {
-                values.push(None);
+/// Shared accumulation buffers that the worker mutates and the UI reads.
+struct ImageBuffers {
+    /// Current image width in pixels.
+    width: usize,
+    /// Current image height in pixels.
+    height: usize,
+    /// Accumulated sample sums per pixel.
+    accum: Vec<f32>,
+    /// Number of samples contributing to each pixel.
+    samples: Vec<u32>,
+}
+
+impl ImageBuffers {
+    /// Create an empty buffer.
+    fn new() -> Self {
+        Self {
+            width: 0,
+            height: 0,
+            accum: Vec::new(),
+            samples: Vec::new(),
+        }
+    }
+
+    /// Resize the buffers and zero all accumulated data.
+    fn resize_and_clear(&mut self, width: usize, height: usize) {
+        let len = width * height;
+        self.width = width;
+        self.height = height;
+        self.accum.clear();
+        self.accum.resize(len, 0.0);
+        self.samples.clear();
+        self.samples.resize(len, 0);
+    }
+
+    /// Return an iterator-friendly snapshot of the current min/max means.
+    fn min_max(&self) -> Option<(f32, f32)> {
+        let mut min = f32::INFINITY;
+        let mut max = f32::NEG_INFINITY;
+        for (sum, count) in self.accum.iter().zip(self.samples.iter()) {
+            if *count == 0 {
                 continue;
             }
-            let mut rng = Rng::seed_from(((i as u64) << 32) ^ (j as u64) ^ 0xA5A5_1234_5678);
-            let mut accum = 0.0;
-            for _ in 0..config.samples_per_pixel {
-                let sample = solver.laplace_dirichlet(&bc, walk, &mut rng, position);
-                accum += sample;
+            let mean = *sum / *count as f32;
+            if mean < min {
+                min = mean;
             }
-            values.push(Some(accum / config.samples_per_pixel as f32));
+            if mean > max {
+                max = mean;
+            }
+        }
+        if min.is_finite() && max.is_finite() {
+            // Stabilise the colour scale if the solution is nearly constant.
+            if (max - min).abs() < f32::EPSILON {
+                max = min + 1e-4;
+            }
+            Some((min, max))
+        } else {
+            None
         }
     }
 
-    Ok(values)
+    /// Total number of Monte Carlo samples accumulated across the image.
+    fn total_samples(&self) -> u64 {
+        self.samples.iter().map(|&c| c as u64).sum()
+    }
 }
 
-/// Save the heatmap to disk as a PNG file.
-fn save_heatmap(values: &[Option<f32>], output: &PathBuf, grid: u32) -> Result<(), Box<dyn Error>> {
-    let valid: Vec<f32> = values.iter().filter_map(|v| *v).collect();
-    if valid.is_empty() {
-        return Err("No valid interior samples found".into());
-    }
-    let (min, max) = min_max(&valid);
-    let mut image = ImageBuffer::<Rgb<u8>, Vec<u8>>::new(grid, grid);
+/// Top-level eframe application responsible for the UI and worker orchestration.
+struct ProbeApp {
+    /// Current UI-side configuration.
+    params: ProbeParams,
+    /// Shared accumulation buffers.
+    buffers: Arc<Mutex<ImageBuffers>>,
+    /// Channel used to push commands to the worker.
+    cmd_tx: Sender<WorkerCommand>,
+    /// Channel used by the worker to publish progress.
+    progress_rx: Receiver<ProgressEvent>,
+    /// GPU texture that mirrors the progressive heat-map.
+    texture: Option<TextureHandle>,
+    /// CPU staging buffer used to upload RGBA pixels to `texture`.
+    upload_rgba: Vec<u8>,
+    /// Last known total Monte Carlo sample count.
+    latest_total_samples: u64,
+    /// Tracks whether a new frame arrived and needs uploading.
+    dirty: bool,
+}
 
-    for (idx, value) in values.iter().enumerate() {
-        let x = (idx % grid as usize) as u32;
-        let y = (idx / grid as usize) as u32;
-        let pixel = match value {
-            Some(v) => Rgb(heat_color(*v, min, max)),
-            None => Rgb([0, 0, 0]),
+impl ProbeApp {
+    /// Construct the app, spawn the worker thread, and kick off the first render.
+    fn new(cc: &CreationContext<'_>) -> Self {
+        let buffers = Arc::new(Mutex::new(ImageBuffers::new()));
+        let (cmd_tx, progress_rx) = spawn_worker(buffers.clone());
+
+        let mut app = Self {
+            params: ProbeParams::default(),
+            buffers,
+            cmd_tx,
+            progress_rx,
+            texture: None,
+            upload_rgba: Vec::new(),
+            latest_total_samples: 0,
+            dirty: false,
         };
-        image.put_pixel(x, grid - 1 - y, pixel);
+
+        // Prime the worker with the default configuration.
+        app.push_config();
+        // Provide an initial placeholder texture so the central panel can render immediately.
+        app.ensure_texture(
+            &cc.egui_ctx,
+            [app.params.grid as usize, app.params.grid as usize],
+        );
+
+        app
     }
 
-    image.save(output)?;
-    Ok(())
+    /// Send the current configuration to the worker and reset local counters.
+    fn push_config(&mut self) {
+        self.latest_total_samples = 0;
+        let params = self.params.clone();
+        self.upload_rgba.clear();
+        if let Err(err) = self.cmd_tx.send(WorkerCommand::Configure(params)) {
+            eprintln!("heat_probe: failed to send configuration: {err:?}");
+        }
+    }
+
+    /// Rebuild `upload_rgba` and refresh the GPU texture from the shared buffers.
+    fn refresh_texture(&mut self, ctx: &Context) -> bool {
+        // Try to lock the shared buffers for reading.
+        let guard = match self.buffers.try_lock() {
+            Ok(guard) => guard,
+            Err(TryLockError::Poisoned(poisoned)) => poisoned.into_inner(),
+            Err(TryLockError::WouldBlock) => {
+                // Worker currently owns the lock; try again next frame.
+                return false;
+            }
+        };
+        // If the buffers are empty, there's nothing to display.
+        if guard.width == 0 || guard.height == 0 {
+            return true;
+        }
+
+        // Ensure the staging RGBA buffer is the correct size.
+        let len_rgba = guard.width * guard.height * 4;
+        if self.upload_rgba.len() != len_rgba {
+            self.upload_rgba.resize(len_rgba, 0);
+        }
+
+        // Compute the current min/max for tone-mapping.
+        let range = guard.min_max();
+        let (min, max) = range.unwrap_or((0.0, 1.0));
+        // Update the total sample count.
+        self.latest_total_samples = guard.total_samples();
+
+        // Tone-map the floating point buffer into RGBA for the GUI.
+        for (idx, rgba) in self.upload_rgba.chunks_exact_mut(4).enumerate() {
+            if guard.samples[idx] == 0 {
+                // Use a dark grey for unvisited pixels.
+                rgba.copy_from_slice(&[12, 12, 12, 255]);
+            } else {
+                // Map the mean value to a heat color.
+                let mean = guard.accum[idx] / guard.samples[idx] as f32;
+                let rgb = heat_color(mean, min, max);
+                rgba.copy_from_slice(&[rgb[0], rgb[1], rgb[2], 255]);
+            }
+        }
+
+        // Create an egui image from the RGBA buffer.
+        let color_image =
+            ColorImage::from_rgba_unmultiplied([guard.width, guard.height], &self.upload_rgba);
+        drop(guard);
+
+        // Update or recreate the GPU texture.
+        self.ensure_texture(ctx, color_image.size);
+        if let Some(texture) = self.texture.as_mut() {
+            texture.set(color_image, TextureOptions::LINEAR);
+        }
+        true
+    }
+
+    /// Lazily create or resize the GPU texture used for display.
+    fn ensure_texture(&mut self, ctx: &Context, size: [usize; 2]) {
+        let needs_new = match &self.texture {
+            Some(tex) => tex.size() != size,
+            None => true,
+        };
+        if needs_new {
+            let placeholder = ColorImage::new(size, Color32::BLACK);
+            self.texture =
+                Some(ctx.load_texture("heat_probe_texture", placeholder, TextureOptions::NEAREST));
+        }
+    }
 }
 
-fn min_max(values: &[f32]) -> (f32, f32) {
-    let mut min = f32::INFINITY;
-    let mut max = f32::NEG_INFINITY;
-    for &v in values {
-        if v < min {
-            min = v;
+impl App for ProbeApp {
+    fn update(&mut self, ctx: &Context, _frame: &mut Frame) {
+        // Consume progress notifications before building the UI.
+        while let Ok(event) = self.progress_rx.try_recv() {
+            if matches!(event, ProgressEvent::FrameReady) {
+                self.dirty = true;
+            }
         }
-        if v > max {
-            max = v;
+        // If new samples are available, refresh the texture.
+        if self.dirty {
+            if self.refresh_texture(ctx) {
+                self.dirty = false;
+                ctx.request_repaint();
+            } else {
+                // Failed to grab the buffer lock; try again soon.
+                ctx.request_repaint();
+            }
         }
+
+        // Left side panel contains the controls.
+        egui::SidePanel::left("controls")
+            .resizable(false)
+            .default_width(240.0)
+            .show(ctx, |ui| {
+                ui.heading("Heat Probe");
+                ui.label("Adjust the estimator and slice parameters below.");
+                ui.separator();
+
+                let mut changed = false;
+
+                changed |= ui
+                    .add(Slider::new(&mut self.params.slice_z, -1.0..=1.0).text("Slice z"))
+                    .changed();
+                changed |= ui
+                    .add(
+                        Slider::new(&mut self.params.grid, 32..=256)
+                            .logarithmic(true)
+                            .text("Resolution"),
+                    )
+                    .changed();
+                changed |= ui
+                    .add(
+                        Slider::new(&mut self.params.samples_per_pass, 1..=64)
+                            .logarithmic(true)
+                            .text("Samples/pass"),
+                    )
+                    .changed();
+                changed |= ui
+                    .add(
+                        Slider::new(&mut self.params.epsilon, 1e-5..=5e-2)
+                            .logarithmic(true)
+                            .text("Epsilon"),
+                    )
+                    .changed();
+                changed |= ui
+                    .add(
+                        Slider::new(&mut self.params.max_steps, 1_000..=100_000)
+                            .logarithmic(true)
+                            .text("Max steps"),
+                    )
+                    .changed();
+
+                if ui.button("Reset accumulation").clicked() {
+                    changed = true;
+                }
+
+                // If any parameter changed, push the new configuration to the worker.
+                if changed {
+                    self.push_config();
+                }
+
+                // Display some stats at the bottom.
+                ui.separator();
+                ui.label(format!("Total samples: {}", self.latest_total_samples));
+                ui.label(format!("Current z: {:.3}", self.params.slice_z));
+            });
+
+        // Central panel displays the heat-map texture.
+        egui::CentralPanel::default().show(ctx, |ui| {
+            ui.vertical_centered(|ui| {
+                if let Some(texture) = &self.texture {
+                    let available = ui.available_size();
+                    let image_size = texture.size_vec2();
+                    let scale = (available.x / image_size.x)
+                        .min(available.y / image_size.y)
+                        .max(0.01);
+                    let draw_size = image_size * scale;
+                    ui.add(egui::Image::new((texture.id(), draw_size)));
+                } else {
+                    ui.add_space(20.0);
+                    ui.label("Waiting for samples…");
+                }
+            });
+        });
     }
-    if (max - min).abs() < f32::EPSILON {
-        max = min + 1e-4;
-    }
-    (min, max)
 }
 
+impl Drop for ProbeApp {
+    /// Ensure the worker thread is cleanly terminated on app shutdown.
+    fn drop(&mut self) {
+        let _ = self.cmd_tx.send(WorkerCommand::Exit);
+    }
+}
+
+/// Spawn the Monte Carlo worker thread and return the communication channels.
+fn spawn_worker(
+    buffers: Arc<Mutex<ImageBuffers>>,
+) -> (Sender<WorkerCommand>, Receiver<ProgressEvent>) {
+    let (cmd_tx, cmd_rx) = mpsc::channel::<WorkerCommand>();
+    let (progress_tx, progress_rx) = mpsc::channel::<ProgressEvent>();
+
+    thread::spawn(move || {
+        const PIXELS_PER_BATCH: usize = 512;
+        let domain = SdfDomain::new(|p: Vec3| p.length() - 1.0);
+        let accel = ClosestNaive;
+        let solver = Solver::builder(&domain, &accel).build();
+        let bc = BoundaryDirichletFn::new(|p: Vec3| p.x + p.y + p.z);
+        let mut rng = Rng::seed_from(0xD1CE_F00Du64);
+        let mut current: Option<ProbeParams> = None;
+        // Batch cursor for progressive evaluation.
+        let mut cursor: usize = 0;
+
+        loop {
+            // Always drain the command queue first to react instantly to UI edits.
+            let mut latest_config = None;
+            while let Ok(cmd) = cmd_rx.try_recv() {
+                match cmd {
+                    WorkerCommand::Configure(params) => latest_config = Some(params),
+                    WorkerCommand::Exit => return,
+                }
+            }
+            // If there was a new configuration, apply it now.
+            if let Some(params) = latest_config {
+                let mut guard = match buffers.lock() {
+                    Ok(g) => g,
+                    Err(p) => p.into_inner(),
+                };
+                guard.resize_and_clear(params.grid as usize, params.grid as usize);
+                drop(guard);
+                current = Some(params);
+                cursor = 0;
+                continue;
+            }
+
+            // Ensure we have a valid configuration to work with.
+            let params = match current.clone() {
+                Some(cfg) => cfg,
+                None => match cmd_rx.recv() {
+                    Ok(WorkerCommand::Configure(cfg)) => {
+                        let mut guard = match buffers.lock() {
+                            Ok(g) => g,
+                            Err(p) => p.into_inner(),
+                        };
+                        guard.resize_and_clear(cfg.grid as usize, cfg.grid as usize);
+                        drop(guard);
+                        current = Some(cfg);
+                        cursor = 0;
+                        continue;
+                    }
+                    Ok(WorkerCommand::Exit) | Err(_) => return,
+                },
+            };
+
+            let walk = WalkBudget::new(params.epsilon, params.max_steps);
+            let grid = params.grid as usize;
+            let total_pixels = grid.saturating_mul(grid);
+            if total_pixels == 0 {
+                thread::yield_now(); // TODO: avoid yield_now usage
+                continue;
+            }
+            let half = 1.0f32;
+            let step = (half * 2.0) / grid as f32;
+
+            let batch = PIXELS_PER_BATCH.min(total_pixels);
+            let mut updates = Vec::with_capacity(batch);
+
+            // Process a batch of pixels starting from the current cursor.
+            for n in 0..batch {
+                let idx = (cursor + n) % total_pixels;
+                let i = idx % grid;
+                let j = idx / grid;
+                let x = -half + (i as f32 + 0.5) * step;
+                let y = -half + (j as f32 + 0.5) * step;
+                let position = Vec3::new(x, y, params.slice_z);
+                if !domain.is_inside(position) {
+                    continue;
+                }
+
+                let mut accum = 0.0;
+                for _ in 0..params.samples_per_pass {
+                    // Each call produces a new stochastic estimate; averaging keeps the walk unbiased.
+                    let sample = solver.laplace_dirichlet(&bc, walk, &mut rng, position);
+                    accum += sample;
+                }
+                updates.push((idx, accum));
+            }
+            // Advance the batch cursor for the next iteration.
+            cursor = (cursor + batch) % total_pixels;
+
+            // Commit the accumulated results to the shared buffers.
+            if !updates.is_empty() {
+                let mut guard = match buffers.lock() {
+                    Ok(g) => g,
+                    Err(p) => p.into_inner(),
+                };
+                for (idx, accum) in updates {
+                    guard.accum[idx] += accum;
+                    guard.samples[idx] += params.samples_per_pass;
+                }
+            }
+
+            // Notify the UI that new data is available.
+            let _ = progress_tx.send(ProgressEvent::FrameReady);
+            thread::yield_now();
+        }
+    });
+
+    (cmd_tx, progress_rx)
+}
+
+/// Traditional blue→red heat-map used to visualise harmonic values.
 fn heat_color(value: f32, min: f32, max: f32) -> [u8; 3] {
     let t = ((value - min) / (max - min)).clamp(0.0, 1.0);
-    // Simple blue -> cyan -> yellow -> red gradient.
+    // 5-stop gradient from the original CLI tool.
     let segments = [
         (0.0, [59, 76, 192]),
         (0.25, [120, 189, 226]),
@@ -172,4 +502,18 @@ fn heat_color(value: f32, min: f32, max: f32) -> [u8; 3] {
         }
     }
     segments.last().unwrap().1
+}
+
+fn main() -> eframe::Result<()> {
+    let options = NativeOptions {
+        viewport: egui::ViewportBuilder::default()
+            .with_inner_size(Vec2::new(960.0, 720.0))
+            .with_min_inner_size(Vec2::new(640.0, 480.0)),
+        ..Default::default()
+    };
+    eframe::run_native(
+        "Heat Probe Viewer",
+        options,
+        Box::new(|cc| Box::new(ProbeApp::new(cc))),
+    )
 }
