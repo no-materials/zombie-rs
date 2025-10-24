@@ -21,7 +21,6 @@ and composability.
 
 - `crates/zombie_rs/` — core library modules and examples.
 - `crates/heat_probe/` — PNG heat-probe generator.
-- `crates/walk_viewer/` — viewer for walk dumps.
 
 ## Quick start
 

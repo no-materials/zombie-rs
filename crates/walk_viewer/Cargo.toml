@@ -1,8 +1,0 @@
-[package]
-name = "walk_viewer"
-publish = false
-edition = "2024"
-description = "Interactive viewer for zombie_rs walk dumps"
-
-[dependencies]
-three-d = { version = "0.18", features = ["window"] }
