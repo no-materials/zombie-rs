@@ -14,11 +14,14 @@ use crate::math::Vec3;
 use crate::observer::{
     TerminationReason, WalkObserver, WalkOutcome, WalkStart, WalkStep, WalkTerminate,
 };
-use crate::params::{GradParams, InteriorSampling, PoissonParams, WalkBudget, WosParams};
+use crate::params::{
+    GradParams, InteriorSampling, PoissonParams, ScreenedPoissonParams, WalkBudget, WosParams,
+};
 use crate::rng::Rng;
 use crate::sampling::{
     ball_volume, green_ball_3d, green_ball_3d_total_mass, sample_ball_by_green_pdf,
-    sample_ball_uniform, wos_jump,
+    sample_ball_by_yukawa_pdf, sample_ball_uniform, wos_jump, yukawa_green_3d,
+    yukawa_normalization_3d, yukawa_total_mass_3d,
 };
 use crate::source::SourceTerm;
 
@@ -187,6 +190,121 @@ where
                 depth: steps,
             });
             return WalkOutcome::new(acc + g.value(c2.point), TerminationReason::MaxSteps, steps);
+        }
+    }
+}
+
+/// Walk-on-Spheres estimator for the screened Poisson equation `(-Δ + c) u = f`.
+///
+/// This sign convention matches the base Poisson estimator (`-Δ u = f`); multiply by `-1` to
+/// recover the form `Δu - c u = -f` used in Eq. (9) of *Monte Carlo Geometry Processing*.
+pub fn wos_screened_poisson_dirichlet<D, A, G, F, O>(
+    domain: &D,
+    accel: &A,
+    g: &G,
+    fsrc: &F,
+    budget: WalkBudget,
+    screen: ScreenedPoissonParams,
+    rng: &mut Rng,
+    mut x: Vec3,
+    observer: &O,
+) -> WalkOutcome
+where
+    D: Domain,
+    A: ClosestAccel<D>,
+    G: BoundaryDirichlet,
+    F: SourceTerm,
+    O: WalkObserver,
+{
+    debug_assert!(
+        domain.is_inside(x),
+        "wos_screened_poisson_dirichlet: x must be inside Ω"
+    );
+
+    let params: WosParams = budget.into();
+    let mut acc = 0.0_f32;
+    let mut weight = 1.0_f32;
+    let mut steps = 0u32;
+    let point = fsrc.point_params();
+
+    observer.on_start(WalkStart { position: x });
+
+    loop {
+        let c = accel.closest(domain, x);
+        let radius = c.distance;
+
+        if radius <= params.epsilon {
+            observer.on_terminate(WalkTerminate {
+                position: c.point,
+                reason: TerminationReason::HitBoundary,
+                depth: steps,
+            });
+            return WalkOutcome::new(
+                acc + weight * g.value(c.point),
+                TerminationReason::HitBoundary,
+                steps,
+            );
+        }
+
+        observer.on_step(WalkStep {
+            position: x,
+            radius,
+            depth: steps,
+        });
+
+        // Dirac contribution handled analytically using G_c (Appendix B.2).
+        if let Some((z, q)) = point {
+            let r = (z - x).length();
+            if r <= radius {
+                let kernel = yukawa_green_3d(screen.c, r.max(screen.min_r), radius);
+                acc += weight * q * kernel;
+            }
+        }
+
+        // Volume contribution: ∫_B G_c(x, y) f(y) dy.
+        let m = screen.interior_samples_per_step.max(1);
+        match screen.sampling {
+            InteriorSampling::Uniform => {
+                let vol = ball_volume(radius);
+                let inv_m = 1.0 / (m as f32);
+                let mut sum = 0.0;
+                for _ in 0..m {
+                    let y = sample_ball_uniform(rng, x, radius);
+                    let r = (y - x).length().max(screen.min_r);
+                    let kernel = yukawa_green_3d(screen.c, r, radius);
+                    sum += kernel * fsrc.value(y);
+                }
+                acc += weight * vol * (sum * inv_m);
+            }
+            InteriorSampling::GreenBall => {
+                let z_mass = yukawa_total_mass_3d(screen.c, radius);
+                let inv_m = 1.0 / (m as f32);
+                let mut sum = 0.0;
+                for _ in 0..m {
+                    let y = sample_ball_by_yukawa_pdf(rng, x, radius, screen.c);
+                    sum += fsrc.value(y);
+                }
+                acc += weight * z_mass * (sum * inv_m);
+            }
+        }
+
+        weight *= yukawa_normalization_3d(screen.c, radius);
+
+        x = wos_jump(x, radius, rng);
+        steps += 1;
+
+        if steps >= params.max_steps {
+            let c2 = accel.closest(domain, x);
+            observer.on_terminate(WalkTerminate {
+                position: c2.point,
+                reason: TerminationReason::MaxSteps,
+                depth: steps,
+            });
+            return WalkOutcome::new(
+                acc + weight * g.value(c2.point),
+                TerminationReason::MaxSteps,
+                steps,
+            );
         }
     }
 }

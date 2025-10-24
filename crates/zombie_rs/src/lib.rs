@@ -28,14 +28,14 @@ pub use domain::sdf_csg;
 pub use domain::{Closest, Domain, PolygonSoupDomain, SdfDomain};
 pub use estimators::{
     grad_laplace_dirichlet_wos, grad_poisson_dirichlet_wos, wos_laplace_dirichlet,
-    wos_poisson_dirichlet,
+    wos_poisson_dirichlet, wos_screened_poisson_dirichlet,
 };
 pub use math::{Aabb, Vec3, closest_point_on_triangle};
 pub use observer::{
     NoopObserver, PlyRecorder, StatsObserver, TerminationReason, WalkObserver, WalkOutcome,
     WalkStatsSnapshot,
 };
-pub use params::{GradParams, InteriorSampling, PoissonParams, WalkBudget};
+pub use params::{GradParams, InteriorSampling, PoissonParams, ScreenedPoissonParams, WalkBudget};
 pub use rng::Rng;
 pub use solver::{Solver, SolverBuilder};
 pub use source::{PointSource, SourceTerm};
@@ -44,6 +44,25 @@ pub use stats::Stats;
 #[cfg(test)]
 mod tests {
     use crate::*;
+    use libm::sinhf;
+
+    /// Constant zero right-hand side helper (Eq. 9).
+    struct ZeroSource;
+    impl SourceTerm for ZeroSource {
+        #[inline]
+        fn value(&self, _x: Vec3) -> f32 {
+            0.0
+        }
+    }
+
+    /// Constant unit source helper (Eq. 9).
+    struct SourceOne;
+    impl SourceTerm for SourceOne {
+        #[inline]
+        fn value(&self, _x: Vec3) -> f32 {
+            1.0
+        }
+    }
 
     /// Run many **Poisson** single-path estimates of u(x) and return Welford stats.
     fn poisson_repeat_and_stats<'a, D, A, G, F>(
@@ -69,6 +88,91 @@ mod tests {
             stats.push(u);
         }
         stats
+    }
+
+    #[test]
+    fn screened_poisson_unit_ball_dirichlet() {
+        let sigma = 2.0;
+        let c = sigma * sigma;
+        let sphere = SdfDomain::new(|p: Vec3| p.length() - 1.0);
+        let accel = ClosestNaive;
+        let solver = Solver::builder(&sphere, &accel).build();
+        let g_one = BoundaryDirichletFn::new(|_p| 1.0);
+        let zero = ZeroSource;
+
+        let walk = WalkBudget::new(1e-4, 40_000);
+        let screen = ScreenedPoissonParams::new(c);
+
+        let query = Vec3::new(0.35, -0.2, 0.1);
+        let exact = screened_ball_solution(query.length(), sigma);
+
+        let mut stats = Stats::default();
+        let mut rng = rng::Rng::seed_from(2025);
+        for _ in 0..5_000 {
+            let value =
+                solver.screened_poisson_dirichlet(&g_one, &zero, walk, screen, &mut rng, query);
+            stats.push(value);
+        }
+
+        assert!(
+            (stats.mean() - exact).abs() < 0.08,
+            "mean {} vs analytic {}",
+            stats.mean(),
+            exact
+        );
+    }
+
+    fn screened_ball_solution(r: f32, sigma: f32) -> f32 {
+        let denom = sinhf(sigma);
+        if r < 1e-4 {
+            sigma / denom
+        } else {
+            sinhf(sigma * r) / (r * denom)
+        }
+    }
+
+    /// Analytic solution for `(-Δ + σ²) u = 1`, `u|_{∂Ω}=0` in the 3D unit ball (Appendix B.2).
+    fn screened_constant_source_solution(r: f32, sigma: f32) -> f32 {
+        let denom = sinhf(sigma);
+        let sigma_sq = sigma * sigma;
+        if r < 1e-4 {
+            (1.0 - sigma / denom) / sigma_sq
+        } else {
+            let ratio = sinhf(sigma * r) / (r * denom);
+            (1.0 - ratio) / sigma_sq
+        }
+    }
+
+    #[test]
+    fn screened_poisson_unit_ball_constant_source() {
+        let sigma = 1.5;
+        let c = sigma * sigma;
+        let sphere = SdfDomain::new(|p: Vec3| p.length() - 1.0);
+        let accel = ClosestNaive;
+        let solver = Solver::builder(&sphere, &accel).build();
+        let g0 = BoundaryDirichletFn::new(|_p| 0.0);
+        let src = SourceOne;
+
+        let walk = WalkBudget::new(1e-4, 50_000);
+        let screen = ScreenedPoissonParams::new(c)
+            .with_samples(8)
+            .with_sampling(InteriorSampling::GreenBall);
+        let point = Vec3::new(0.2, -0.1, 0.05);
+        let exact = screened_constant_source_solution(point.length(), sigma);
+
+        let mut stats = Stats::default();
+        let mut rng = rng::Rng::seed_from(4242);
+        for _ in 0..6_000 {
+            let value = solver.screened_poisson_dirichlet(&g0, &src, walk, screen, &mut rng, point);
+            stats.push(value);
+        }
+
+        assert!(
+            (stats.mean() - exact).abs() < 0.1,
+            "mean {} vs analytic {}",
+            stats.mean(),
+            exact
+        );
     }
 
     #[test]

@@ -8,7 +8,7 @@ and composability.
 
 ## Current snapshot
 
-- Walk-on-Spheres estimators for Laplace and Poisson Dirichlet problems on mesh
+- Walk-on-Spheres estimators for Laplace and (screened) Poisson Dirichlet problems on mesh
   and SDF domains.
 - Observer hooks for per-walk telemetry and gradient estimators that reuse the
   same interface.

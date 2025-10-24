@@ -86,6 +86,50 @@ impl PoissonParams {
     }
 }
 
+/// Screening configuration for the Helmholtz/screened Poisson equation `(-Δ + c) u = f`.
+///
+/// Appendix B.2 in *Monte Carlo Geometry Processing* defines the Yukawa potential and
+/// normalization factors used by the screened estimator.
+#[derive(Copy, Clone, Debug)]
+pub struct ScreenedPoissonParams {
+    /// Screening coefficient `c` from Eq. (9) (Appendix B.2).
+    pub c: f32,
+    /// Number of interior samples per step (Appendix B.2 normalization).
+    pub interior_samples_per_step: u32,
+    /// Clamp for near-singular denominators in Yukawa kernel.
+    pub min_r: f32,
+    /// How to sample interior points. `GreenBall` draws from the Yukawa kernel (Appendix B.2).
+    pub sampling: InteriorSampling,
+}
+
+impl ScreenedPoissonParams {
+    /// Create a new configuration with the provided screening coefficient `c`.
+    pub fn new(c: f32) -> Self {
+        Self {
+            c,
+            interior_samples_per_step: 1,
+            min_r: 1e-7,
+            sampling: InteriorSampling::Uniform,
+        }
+    }
+
+    pub const fn with_samples(self, samples: u32) -> Self {
+        let count = if samples == 0 { 1 } else { samples };
+        Self {
+            interior_samples_per_step: count,
+            ..self
+        }
+    }
+
+    pub const fn with_min_r(self, min_r: f32) -> Self {
+        Self { min_r, ..self }
+    }
+
+    pub const fn with_sampling(self, sampling: InteriorSampling) -> Self {
+        Self { sampling, ..self }
+    }
+}
+
 /// Gradient estimator knobs (used by both Laplace/Poisson).
 #[derive(Copy, Clone, Debug)]
 pub struct GradParams {

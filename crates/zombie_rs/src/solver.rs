@@ -11,11 +11,11 @@ use crate::accel::ClosestAccel;
 use crate::boundary::BoundaryDirichlet;
 use crate::estimators::{
     grad_laplace_dirichlet_wos, grad_poisson_dirichlet_wos, wos_laplace_dirichlet,
-    wos_poisson_dirichlet,
+    wos_poisson_dirichlet, wos_screened_poisson_dirichlet,
 };
 use crate::math::Vec3;
 use crate::observer::{ObserverList, WalkObserver};
-use crate::params::{GradParams, PoissonParams, WalkBudget};
+use crate::params::{GradParams, PoissonParams, ScreenedPoissonParams, WalkBudget};
 use crate::rng::Rng;
 use crate::source::SourceTerm;
 
@@ -132,6 +132,35 @@ where
             fsrc,
             walk,
             poisson,
+            rng,
+            query,
+            &observers,
+        )
+        .value
+    }
+
+    /// Solve the screened Poisson problem `(-Δ + c) u = f` (Eq. 9; App. B.2).
+    pub fn screened_poisson_dirichlet<G, F>(
+        &self,
+        g: &G,
+        fsrc: &F,
+        walk: WalkBudget,
+        screen: ScreenedPoissonParams,
+        rng: &mut Rng,
+        query: Vec3,
+    ) -> f32
+    where
+        G: BoundaryDirichlet,
+        F: SourceTerm,
+    {
+        let observers = self.observer_list();
+        wos_screened_poisson_dirichlet(
+            self.domain,
+            self.accel,
+            g,
+            fsrc,
+            walk,
+            screen,
             rng,
             query,
             &observers,
