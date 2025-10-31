@@ -17,6 +17,7 @@ use eframe::egui::{
     self, Color32, ColorImage, Context, Slider, TextureHandle, TextureOptions, Vec2,
 };
 use eframe::{App, CreationContext, Frame, NativeOptions};
+use rayon::prelude::*;
 use zombie_rs::{
     BoundaryDirichletFn, ClosestNaive, Domain, Rng, SdfDomain, Solver, Vec3, WalkBudget,
 };
@@ -374,10 +375,11 @@ fn spawn_worker(
         let accel = ClosestNaive;
         let solver = Solver::builder(&domain, &accel).build();
         let bc = BoundaryDirichletFn::new(|p: Vec3| p.x + p.y + p.z);
-        let mut rng = Rng::seed_from(0xD1CE_F00Du64);
         let mut current: Option<ProbeParams> = None;
         // Batch cursor for progressive evaluation.
         let mut cursor: usize = 0;
+        // Counts how many batches have been processed (used for deterministic seeding).
+        let mut pass_index: u64 = 0;
 
         loop {
             // Always drain the command queue first to react instantly to UI edits.
@@ -424,47 +426,63 @@ fn spawn_worker(
             let grid = params.grid as usize;
             let total_pixels = grid.saturating_mul(grid);
             if total_pixels == 0 {
-                thread::yield_now(); // TODO: avoid yield_now usage
+                thread::yield_now();
                 continue;
             }
+
+            // Precompute constants for mapping pixel indices to positions.
             let half = 1.0f32;
             let step = (half * 2.0) / grid as f32;
 
+            // Determine the next batch of pixels to process.
             let batch = PIXELS_PER_BATCH.min(total_pixels);
-            let mut updates = Vec::with_capacity(batch);
-
-            // Process a batch of pixels starting from the current cursor.
-            for n in 0..batch {
-                let idx = (cursor + n) % total_pixels;
-                let i = idx % grid;
-                let j = idx / grid;
-                let x = -half + (i as f32 + 0.5) * step;
-                let y = -half + (j as f32 + 0.5) * step;
-                let position = Vec3::new(x, y, params.slice_z);
-                if !domain.is_inside(position) {
-                    continue;
-                }
-
-                let mut accum = 0.0;
-                for _ in 0..params.samples_per_pass {
-                    // Each call produces a new stochastic estimate; averaging keeps the walk unbiased.
-                    let sample = solver.laplace_dirichlet(&bc, walk, &mut rng, position);
-                    accum += sample;
-                }
-                updates.push((idx, accum));
-            }
-            // Advance the batch cursor for the next iteration.
+            let indices: Vec<usize> = (0..batch).map(|n| (cursor + n) % total_pixels).collect();
             cursor = (cursor + batch) % total_pixels;
 
-            // Commit the accumulated results to the shared buffers.
+            // Capture the current pass index for deterministic seeding.
+            let pass_id = pass_index;
+            pass_index = pass_index.wrapping_add(1);
+
+            let updates: Vec<(usize, f32, u32)> = indices
+                .par_iter()
+                .filter_map(|&idx| {
+                    let i = idx % grid;
+                    let j = idx / grid;
+                    let x = -half + (i as f32 + 0.5) * step;
+                    let y = -half + (j as f32 + 0.5) * step;
+                    let position = Vec3::new(x, y, params.slice_z);
+
+                    // Skip pixels outside the domain.
+                    if !domain.is_inside(position) {
+                        return None;
+                    }
+
+                    // Derive a deterministic per-pixel seed.
+                    let mut seed =
+                        splitmix64((idx as u64) ^ pass_id.wrapping_mul(0x9E37_79B9_7F4A_7C15));
+                    if let Some(tid) = rayon::current_thread_index() {
+                        seed ^= (tid as u64).rotate_left(17);
+                    }
+                    let mut local_rng = Rng::seed_from(seed);
+
+                    // Accumulate samples for this pixel.
+                    let mut sum = 0.0f32;
+                    for _ in 0..params.samples_per_pass {
+                        let sample = solver.laplace_dirichlet(&bc, walk, &mut local_rng, position);
+                        sum += sample;
+                    }
+                    Some((idx, sum, params.samples_per_pass))
+                })
+                .collect();
+
             if !updates.is_empty() {
                 let mut guard = match buffers.lock() {
                     Ok(g) => g,
                     Err(p) => p.into_inner(),
                 };
-                for (idx, accum) in updates {
-                    guard.accum[idx] += accum;
-                    guard.samples[idx] += params.samples_per_pass;
+                for (idx, sum, count) in updates {
+                    guard.accum[idx] += sum;
+                    guard.samples[idx] += count;
                 }
             }
 
@@ -475,6 +493,16 @@ fn spawn_worker(
     });
 
     (cmd_tx, progress_rx)
+}
+
+/// SplitMix64 PRNG mixer used to derive deterministic seeds for parallel workers.
+#[inline]
+fn splitmix64(mut x: u64) -> u64 {
+    x = x.wrapping_add(0x9E37_79B9_7F4A_7C15);
+    let mut z = x;
+    z = (z ^ (z >> 30)).wrapping_mul(0xBF58_476D_1CE4_E5B9);
+    z = (z ^ (z >> 27)).wrapping_mul(0x94D0_49BB_1331_11EB);
+    z ^ (z >> 31)
 }
 
 /// Traditional blue→red heat-map used to visualise harmonic values.
