@@ -22,6 +22,39 @@ use zombie_rs::{
     BoundaryDirichletFn, ClosestNaive, Domain, Rng, SdfDomain, Solver, Vec3, WalkBudget,
 };
 
+/// Available boundary condition presets.
+#[derive(Clone, Copy, Debug, PartialEq)]
+enum BoundaryPreset {
+    /// Constant boundary value `g(p) = c`.
+    Constant(f32),
+    /// Coefficients `(a, b, c)` and bias `d` for the linear function `g(x, y, z) = a·x + b·y + c·z + d`.
+    Linear((Vec3, f32)),
+}
+
+/// Parameters controlling the boundary condition shown in the viewer.
+#[derive(Clone, Debug)]
+struct BoundaryParams {
+    preset: BoundaryPreset,
+}
+
+impl Default for BoundaryParams {
+    fn default() -> Self {
+        Self {
+            preset: BoundaryPreset::Linear((Vec3::new(1.0, 1.0, 1.0), 0.0)),
+        }
+    }
+}
+
+impl BoundaryParams {
+    /// Evaluate the configured boundary condition at `p`.
+    fn evaluate(&self, p: Vec3) -> f32 {
+        match self.preset {
+            BoundaryPreset::Constant(c) => c,
+            BoundaryPreset::Linear((coeff, bias)) => coeff.dot(p) + bias,
+        }
+    }
+}
+
 /// Runtime parameters that govern how the worker evaluates the heat probe.
 #[derive(Clone, Debug)]
 struct ProbeParams {
@@ -35,6 +68,8 @@ struct ProbeParams {
     epsilon: f32,
     /// Walk-on-Spheres maximum steps safeguard.
     max_steps: u32,
+    /// Boundary condition parameters.
+    boundary: BoundaryParams,
 }
 
 impl Default for ProbeParams {
@@ -45,6 +80,7 @@ impl Default for ProbeParams {
             samples_per_pass: 4,
             epsilon: 1e-3,
             max_steps: 10_000,
+            boundary: BoundaryParams::default(),
         }
     }
 }
@@ -320,6 +356,48 @@ impl App for ProbeApp {
                     )
                     .changed();
 
+                ui.separator();
+                ui.label("Boundary condition");
+                let prev_preset = self.params.boundary.preset;
+                egui::ComboBox::from_id_source("boundary_preset")
+                    .selected_text(match self.params.boundary.preset {
+                        BoundaryPreset::Constant(_) => "Constant",
+                        BoundaryPreset::Linear(_) => "Linear",
+                    })
+                    .show_ui(ui, |ui| {
+                        ui.selectable_value(
+                            &mut self.params.boundary.preset,
+                            BoundaryPreset::Constant(1.0),
+                            "Constant",
+                        );
+                        ui.selectable_value(
+                            &mut self.params.boundary.preset,
+                            BoundaryPreset::Linear((Vec3::new(1.0, 0.0, 0.0), 0.0)),
+                            "Linear",
+                        );
+                    });
+                if self.params.boundary.preset != prev_preset {
+                    changed = true;
+                }
+
+                match self.params.boundary.preset {
+                    BoundaryPreset::Constant(ref mut c) => {
+                        changed |= ui.add(Slider::new(c, -2.0..=2.0).text("Value")).changed();
+                    }
+                    BoundaryPreset::Linear((ref mut coeff, ref mut bias)) => {
+                        changed |= ui
+                            .add(Slider::new(&mut coeff.x, -2.0..=2.0).text("a · x"))
+                            .changed();
+                        changed |= ui
+                            .add(Slider::new(&mut coeff.y, -2.0..=2.0).text("b · y"))
+                            .changed();
+                        changed |= ui
+                            .add(Slider::new(&mut coeff.z, -2.0..=2.0).text("c · z"))
+                            .changed();
+                        changed |= ui.add(Slider::new(bias, -1.0..=1.0).text("d")).changed();
+                    }
+                }
+
                 if ui.button("Reset accumulation").clicked() {
                     changed = true;
                 }
@@ -374,7 +452,6 @@ fn spawn_worker(
         let domain = SdfDomain::new(|p: Vec3| p.length() - 1.0);
         let accel = ClosestNaive;
         let solver = Solver::builder(&domain, &accel).build();
-        let bc = BoundaryDirichletFn::new(|p: Vec3| p.x + p.y + p.z);
         let mut current: Option<ProbeParams> = None;
         // Batch cursor for progressive evaluation.
         let mut cursor: usize = 0;
@@ -443,35 +520,48 @@ fn spawn_worker(
             let pass_id = pass_index;
             pass_index = pass_index.wrapping_add(1);
 
+            // Evaluate the boundary condition function.
+            let bc = Arc::new(BoundaryDirichletFn::new(move |p: Vec3| {
+                params.boundary.evaluate(p)
+            }));
+
+            let domain_ref = &domain;
+            let solver_ref = &solver;
             let updates: Vec<(usize, f32, u32)> = indices
                 .par_iter()
-                .filter_map(|&idx| {
-                    let i = idx % grid;
-                    let j = idx / grid;
-                    let x = -half + (i as f32 + 0.5) * step;
-                    let y = -half + (j as f32 + 0.5) * step;
-                    let position = Vec3::new(x, y, params.slice_z);
+                .filter_map({
+                    let bc = Arc::clone(&bc);
+                    move |&idx| {
+                        let domain = domain_ref;
+                        let solver = solver_ref;
+                        let i = idx % grid;
+                        let j = idx / grid;
+                        let x = -half + (i as f32 + 0.5) * step;
+                        let y = -half + (j as f32 + 0.5) * step;
+                        let position = Vec3::new(x, y, params.slice_z);
 
-                    // Skip pixels outside the domain.
-                    if !domain.is_inside(position) {
-                        return None;
-                    }
+                        // Skip pixels outside the domain.
+                        if !domain.is_inside(position) {
+                            return None;
+                        }
 
-                    // Derive a deterministic per-pixel seed.
-                    let mut seed =
-                        splitmix64((idx as u64) ^ pass_id.wrapping_mul(0x9E37_79B9_7F4A_7C15));
-                    if let Some(tid) = rayon::current_thread_index() {
-                        seed ^= (tid as u64).rotate_left(17);
-                    }
-                    let mut local_rng = Rng::seed_from(seed);
+                        // Derive a deterministic per-pixel seed.
+                        let mut seed =
+                            splitmix64((idx as u64) ^ pass_id.wrapping_mul(0x9E37_79B9_7F4A_7C15));
+                        if let Some(tid) = rayon::current_thread_index() {
+                            seed ^= (tid as u64).rotate_left(17);
+                        }
+                        let mut local_rng = Rng::seed_from(seed);
 
-                    // Accumulate samples for this pixel.
-                    let mut sum = 0.0f32;
-                    for _ in 0..params.samples_per_pass {
-                        let sample = solver.laplace_dirichlet(&bc, walk, &mut local_rng, position);
-                        sum += sample;
+                        // Accumulate samples for this pixel.
+                        let mut sum = 0.0f32;
+                        for _ in 0..params.samples_per_pass {
+                            let sample =
+                                solver.laplace_dirichlet(&*bc, walk, &mut local_rng, position);
+                            sum += sample;
+                        }
+                        Some((idx, sum, params.samples_per_pass))
                     }
-                    Some((idx, sum, params.samples_per_pass))
                 })
                 .collect();
 
