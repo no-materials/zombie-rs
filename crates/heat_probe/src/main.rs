@@ -275,7 +275,7 @@ impl ProbeApp {
         // Update or recreate the GPU texture.
         self.ensure_texture(ctx, color_image.size);
         if let Some(texture) = self.texture.as_mut() {
-            texture.set(color_image, TextureOptions::LINEAR);
+            texture.set(color_image, TextureOptions::NEAREST);
         }
         true
     }
