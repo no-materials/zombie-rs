@@ -19,8 +19,12 @@ use eframe::egui::{
 use eframe::{App, CreationContext, Frame, NativeOptions};
 use rayon::prelude::*;
 use zombie_rs::{
-    BoundaryDirichletFn, ClosestNaive, Domain, Rng, SdfDomain, Solver, Vec3, WalkBudget,
+    BoundaryDirichletFn, ClosestNaive, Domain, InteriorSampling, PoissonParams, Rng, SdfDomain,
+    Solver, SourceTerm, Vec3, WalkBudget,
 };
+
+const SOURCE_EPS: f32 = 1e-6;
+const DIRAC_EPS: f32 = 1e-6;
 
 /// Available boundary condition presets.
 #[derive(Clone, Copy, Debug, PartialEq)]
@@ -55,6 +59,203 @@ impl BoundaryParams {
     }
 }
 
+/// Parameters for an optional Dirac delta source.
+#[derive(Clone, Copy, Debug, PartialEq)]
+struct DiracParams {
+    position: Vec3,
+    strength: f32,
+}
+
+impl Default for DiracParams {
+    fn default() -> Self {
+        Self {
+            position: Vec3::new(0.0, 0.0, 0.0),
+            strength: 1.0,
+        }
+    }
+}
+
+/// High-level source selector used by the viewer.
+#[derive(Clone, Debug)]
+enum SourcePreset {
+    /// No forcing term: falls back to Laplace.
+    None,
+    /// Constant volume source with optional Dirac spike.
+    Constant {
+        value: f32,
+        dirac: Option<DiracParams>,
+    },
+    /// Linear volume source `f(p) = coeff · p + bias` with optional Dirac spike.
+    Linear {
+        coeff: Vec3,
+        bias: f32,
+        dirac: Option<DiracParams>,
+    },
+}
+
+impl Default for SourcePreset {
+    fn default() -> Self {
+        SourcePreset::None
+    }
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum SourceKind {
+    None,
+    Constant,
+    Linear,
+}
+
+impl SourcePreset {
+    fn kind(&self) -> SourceKind {
+        match self {
+            SourcePreset::None => SourceKind::None,
+            SourcePreset::Constant { .. } => SourceKind::Constant,
+            SourcePreset::Linear { .. } => SourceKind::Linear,
+        }
+    }
+
+    fn default_for(kind: SourceKind) -> Self {
+        match kind {
+            SourceKind::None => SourcePreset::None,
+            SourceKind::Constant => SourcePreset::Constant {
+                value: 1.0,
+                dirac: None,
+            },
+            SourceKind::Linear => SourcePreset::Linear {
+                coeff: Vec3::new(1.0, 0.0, 0.0),
+                bias: 0.0,
+                dirac: None,
+            },
+        }
+    }
+
+    fn uses_poisson(&self) -> bool {
+        self.has_regular() || self.has_dirac()
+    }
+
+    fn has_regular(&self) -> bool {
+        match self {
+            SourcePreset::None => false,
+            SourcePreset::Constant { value, .. } => value.abs() > SOURCE_EPS,
+            SourcePreset::Linear { coeff, bias, .. } => {
+                coeff.dot(*coeff) > SOURCE_EPS || bias.abs() > SOURCE_EPS
+            }
+        }
+    }
+
+    fn has_dirac(&self) -> bool {
+        match self {
+            SourcePreset::None => false,
+            SourcePreset::Constant { dirac, .. } | SourcePreset::Linear { dirac, .. } => {
+                dirac.map(|d| d.strength.abs() > DIRAC_EPS).unwrap_or(false)
+            }
+        }
+    }
+
+    fn to_combined(&self) -> CombinedSource {
+        match self {
+            SourcePreset::None => CombinedSource::new(None, None),
+            SourcePreset::Constant { value, dirac } => {
+                let regular = if value.abs() > SOURCE_EPS {
+                    let v = *value;
+                    Some(Arc::new(move |_p: Vec3| v) as Arc<dyn Fn(Vec3) -> f32 + Send + Sync>)
+                } else {
+                    None
+                };
+                let dirac = match dirac {
+                    Some(d) if d.strength.abs() > DIRAC_EPS => Some(*d),
+                    _ => None,
+                };
+                CombinedSource::new(regular, dirac)
+            }
+            SourcePreset::Linear { coeff, bias, dirac } => {
+                let has_regular = coeff.dot(*coeff) > SOURCE_EPS || bias.abs() > SOURCE_EPS;
+                let regular = if has_regular {
+                    let c = *coeff;
+                    let b = *bias;
+                    Some(Arc::new(move |p: Vec3| c.dot(p) + b)
+                        as Arc<dyn Fn(Vec3) -> f32 + Send + Sync>)
+                } else {
+                    None
+                };
+                let dirac = match dirac {
+                    Some(d) if d.strength.abs() > DIRAC_EPS => Some(*d),
+                    _ => None,
+                };
+                CombinedSource::new(regular, dirac)
+            }
+        }
+    }
+}
+
+/// Shared representation of the active source term (regular + optional Dirac spike).
+#[derive(Clone)]
+struct CombinedSource {
+    regular: Option<Arc<dyn Fn(Vec3) -> f32 + Send + Sync>>,
+    dirac: Option<DiracParams>,
+}
+
+impl CombinedSource {
+    fn new(
+        regular: Option<Arc<dyn Fn(Vec3) -> f32 + Send + Sync>>,
+        dirac: Option<DiracParams>,
+    ) -> Self {
+        let dirac = match dirac {
+            Some(d) if d.strength.abs() > DIRAC_EPS => Some(d),
+            _ => None,
+        };
+        Self { regular, dirac }
+    }
+
+    fn is_zero(&self) -> bool {
+        self.regular.is_none() && self.dirac.is_none()
+    }
+}
+
+impl SourceTerm for CombinedSource {
+    fn value(&self, x: Vec3) -> f32 {
+        self.regular.as_ref().map(|f| (f)(x)).unwrap_or(0.0)
+    }
+
+    fn point_params(&self) -> Option<(Vec3, f32)> {
+        self.dirac.map(|d| (d.position, d.strength))
+    }
+}
+
+fn edit_dirac_params(ui: &mut egui::Ui, dirac: &mut Option<DiracParams>) -> bool {
+    let mut changed = false;
+    let mut enabled = dirac.is_some();
+    if ui
+        .checkbox(&mut enabled, "Include Dirac δ source")
+        .changed()
+    {
+        changed = true;
+        if enabled && dirac.is_none() {
+            *dirac = Some(DiracParams::default());
+        } else if !enabled {
+            *dirac = None;
+        }
+    }
+    if let Some(params) = dirac.as_mut() {
+        ui.indent("dirac_controls", |ui| {
+            changed |= ui
+                .add(Slider::new(&mut params.position.x, -1.0..=1.0).text("Position x"))
+                .changed();
+            changed |= ui
+                .add(Slider::new(&mut params.position.y, -1.0..=1.0).text("Position y"))
+                .changed();
+            changed |= ui
+                .add(Slider::new(&mut params.position.z, -1.0..=1.0).text("Position z"))
+                .changed();
+            changed |= ui
+                .add(Slider::new(&mut params.strength, -5.0..=5.0).text("Strength"))
+                .changed();
+        });
+    }
+    changed
+}
+
 /// Runtime parameters that govern how the worker evaluates the heat probe.
 #[derive(Clone, Debug)]
 struct ProbeParams {
@@ -70,6 +271,10 @@ struct ProbeParams {
     max_steps: u32,
     /// Boundary condition parameters.
     boundary: BoundaryParams,
+    /// Source term preset (governs whether Poisson or Laplace is used).
+    source: SourcePreset,
+    /// Interior samples per WoS step when using the Poisson estimator.
+    poisson_samples_per_step: u32,
 }
 
 impl Default for ProbeParams {
@@ -81,6 +286,8 @@ impl Default for ProbeParams {
             epsilon: 1e-3,
             max_steps: 10_000,
             boundary: BoundaryParams::default(),
+            source: SourcePreset::default(),
+            poisson_samples_per_step: 4,
         }
     }
 }
@@ -398,6 +605,61 @@ impl App for ProbeApp {
                     }
                 }
 
+                ui.separator();
+                ui.label("Source term");
+                let mut selected_source = self.params.source.kind();
+                let current_kind = selected_source;
+                egui::ComboBox::from_id_source("source_preset")
+                    .selected_text(match current_kind {
+                        SourceKind::None => "None",
+                        SourceKind::Constant => "Constant",
+                        SourceKind::Linear => "Linear",
+                    })
+                    .show_ui(ui, |ui| {
+                        ui.selectable_value(&mut selected_source, SourceKind::None, "None");
+                        ui.selectable_value(&mut selected_source, SourceKind::Constant, "Constant");
+                        ui.selectable_value(&mut selected_source, SourceKind::Linear, "Linear");
+                    });
+                if selected_source != self.params.source.kind() {
+                    self.params.source = SourcePreset::default_for(selected_source);
+                    changed = true;
+                }
+
+                match &mut self.params.source {
+                    SourcePreset::None => {
+                        ui.label("No source term (Laplace estimator).");
+                    }
+                    SourcePreset::Constant { value, dirac } => {
+                        changed |= ui
+                            .add(Slider::new(value, -2.0..=2.0).text("Value"))
+                            .changed();
+                        changed |= edit_dirac_params(ui, dirac);
+                    }
+                    SourcePreset::Linear { coeff, bias, dirac } => {
+                        changed |= ui
+                            .add(Slider::new(&mut coeff.x, -2.0..=2.0).text("a · x"))
+                            .changed();
+                        changed |= ui
+                            .add(Slider::new(&mut coeff.y, -2.0..=2.0).text("b · y"))
+                            .changed();
+                        changed |= ui
+                            .add(Slider::new(&mut coeff.z, -2.0..=2.0).text("c · z"))
+                            .changed();
+                        changed |= ui.add(Slider::new(bias, -1.0..=1.0).text("d")).changed();
+                        changed |= edit_dirac_params(ui, dirac);
+                    }
+                }
+
+                let uses_poisson = self.params.source.uses_poisson();
+                changed |= ui
+                    .add_enabled(
+                        uses_poisson,
+                        Slider::new(&mut self.params.poisson_samples_per_step, 1..=32)
+                            .logarithmic(true)
+                            .text("Poisson samples/step"),
+                    )
+                    .changed();
+
                 if ui.button("Reset accumulation").clicked() {
                     changed = true;
                 }
@@ -411,6 +673,16 @@ impl App for ProbeApp {
                 ui.separator();
                 ui.label(format!("Total samples: {}", self.latest_total_samples));
                 ui.label(format!("Current z: {:.3}", self.params.slice_z));
+                ui.label(format!(
+                    "Estimator: {}",
+                    if uses_poisson { "Poisson" } else { "Laplace" }
+                ));
+                if uses_poisson {
+                    ui.label(format!(
+                        "Poisson samples/step: {}",
+                        self.params.poisson_samples_per_step
+                    ));
+                }
             });
 
         // Central panel displays the heat-map texture.
@@ -520,10 +792,23 @@ fn spawn_worker(
             let pass_id = pass_index;
             pass_index = pass_index.wrapping_add(1);
 
-            // Evaluate the boundary condition function.
+            // Prepare the boundary condition function.
             let bc = Arc::new(BoundaryDirichletFn::new(move |p: Vec3| {
                 params.boundary.evaluate(p)
             }));
+
+            // Prepare the combined source term.
+            let combined_source = params.source.to_combined();
+            let maybe_source = if combined_source.is_zero() {
+                None
+            } else {
+                Some(Arc::new(combined_source))
+            };
+
+            let poisson = PoissonParams::new(params.poisson_samples_per_step.max(1))
+                .with_sampling(InteriorSampling::GreenBall);
+            let samples_per_pass = params.samples_per_pass;
+            let slice_z = params.slice_z;
 
             let domain_ref = &domain;
             let solver_ref = &solver;
@@ -531,6 +816,7 @@ fn spawn_worker(
                 .par_iter()
                 .filter_map({
                     let bc = Arc::clone(&bc);
+                    let source = maybe_source.clone();
                     move |&idx| {
                         let domain = domain_ref;
                         let solver = solver_ref;
@@ -538,7 +824,7 @@ fn spawn_worker(
                         let j = idx / grid;
                         let x = -half + (i as f32 + 0.5) * step;
                         let y = -half + (j as f32 + 0.5) * step;
-                        let position = Vec3::new(x, y, params.slice_z);
+                        let position = Vec3::new(x, y, slice_z);
 
                         // Skip pixels outside the domain.
                         if !domain.is_inside(position) {
@@ -555,12 +841,23 @@ fn spawn_worker(
 
                         // Accumulate samples for this pixel.
                         let mut sum = 0.0f32;
-                        for _ in 0..params.samples_per_pass {
-                            let sample =
-                                solver.laplace_dirichlet(&*bc, walk, &mut local_rng, position);
+                        for _ in 0..samples_per_pass {
+                            // Evaluate either the Poisson or Laplace estimator.
+                            let sample = if let Some(ref src) = source {
+                                solver.poisson_dirichlet(
+                                    &*bc,
+                                    &**src,
+                                    walk,
+                                    poisson,
+                                    &mut local_rng,
+                                    position,
+                                )
+                            } else {
+                                solver.laplace_dirichlet(&*bc, walk, &mut local_rng, position)
+                            };
                             sum += sample;
                         }
-                        Some((idx, sum, params.samples_per_pass))
+                        Some((idx, sum, samples_per_pass))
                     }
                 })
                 .collect();
