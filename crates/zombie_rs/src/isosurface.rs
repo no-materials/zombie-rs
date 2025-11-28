@@ -1,10 +1,10 @@
 //! Progressive isosurface scaffolding.
 //!
-//! This module defines the data structures and scheduling hooks needed to
-//! incrementally extract an isosurface using Monte Carlo samples, without
-//! performing meshing yet. The intent is to progressively refine an octree of
-//! cells ordered by variance or view importance and let later stages plug in
-//! Walk-on-Spheres evaluations and meshing.
+//! This module implements the sampling core for progressive isosurface extraction.
+//! Cells are refined based on variance or detected sign-changes of the sampled
+//! field, using Monte Carlo estimators from the existing `Solver` API. Meshing
+//! is intentionally deferred to later PRs; this file focuses on deterministic
+//! sampling, statistics accumulation, and refinement scheduling.
 
 extern crate alloc;
 
@@ -15,7 +15,8 @@ use core::cmp::Ordering;
 use core::marker::PhantomData;
 
 use crate::math::{Aabb, Vec3};
-use crate::params::WalkBudget;
+use crate::params::{GradParams, PoissonParams, WalkBudget};
+use crate::rng::Rng;
 use crate::solver::Solver;
 use crate::stats::Stats;
 use crate::{BoundaryDirichlet, ClosestAccel, Domain, SourceTerm};
@@ -29,24 +30,35 @@ pub struct Cell {
     bbox_max: Vec3,
     /// Per-corner streaming statistics of the sampled field.
     samples: [Stats; 8],
+    /// Streaming statistics for the cell center (used when enabled).
+    center: Stats,
+    /// Optional running mean gradients per corner.
+    corner_grad: [Option<Vec3>; 8],
+    /// Optional running mean gradient at the cell center.
+    center_grad: Option<Vec3>,
+    /// Deterministic RNG bound to this cell for reproducible sampling.
+    rng: Rng,
     /// Cached variance proxy for queue priority.
     variance: f32,
     /// Octree depth (root = 0).
     depth: u8,
     /// Child cells in Morton order; `None` when not yet subdivided.
-    #[allow(dead_code)]
     children: [Option<Box<Cell>>; 8],
     /// Logical timestamp used by schedulers to track recency.
     last_touched: u64,
 }
 
 impl Cell {
-    /// Create a new leaf cell covering `bbox_min..bbox_max` at `depth`.
-    pub fn new(bbox_min: Vec3, bbox_max: Vec3, depth: u8) -> Self {
+    /// Create a new leaf cell covering `bbox_min..bbox_max` at `depth` with a deterministic seed.
+    pub fn new(bbox_min: Vec3, bbox_max: Vec3, depth: u8, seed: u64) -> Self {
         Self {
             bbox_min,
             bbox_max,
             samples: core::array::from_fn(|_| Stats::default()),
+            center: Stats::default(),
+            corner_grad: core::array::from_fn(|_| None),
+            center_grad: None,
+            rng: Rng::seed_from(seed),
             variance: 0.0,
             depth,
             children: core::array::from_fn(|_| None),
@@ -77,9 +89,28 @@ impl Cell {
         self.bbox_max
     }
 
-    /// Update the cached variance using the maximum corner variance.
+    /// Corner positions in Morton order (000..111).
+    pub fn corner_positions(&self) -> [Vec3; 8] {
+        let min = self.bbox_min;
+        let max = self.bbox_max;
+        [
+            Vec3::new(min.x, min.y, min.z),
+            Vec3::new(max.x, min.y, min.z),
+            Vec3::new(min.x, max.y, min.z),
+            Vec3::new(max.x, max.y, min.z),
+            Vec3::new(min.x, min.y, max.z),
+            Vec3::new(max.x, min.y, max.z),
+            Vec3::new(min.x, max.y, max.z),
+            Vec3::new(max.x, max.y, max.z),
+        ]
+    }
+
+    /// Update the cached variance using both corner and center statistics.
     pub fn refresh_variance(&mut self) {
-        self.variance = self.samples.iter().fold(0.0_f32, |acc, s| acc.max(s.var()));
+        self.variance = self
+            .samples
+            .iter()
+            .fold(self.center.var(), |acc, s| acc.max(s.var()));
     }
 
     /// Return `true` when the cell can be split.
@@ -87,8 +118,8 @@ impl Cell {
         self.depth < max_depth
     }
 
-    /// Split the cell into eight children; each child starts with empty stats.
-    pub fn subdivide(&self) -> [Cell; 8] {
+    /// Split the cell into eight children seeded with `seeds`; each child starts empty.
+    pub fn subdivide_with_seeds(&self, seeds: [u64; 8]) -> [Cell; 8] {
         let mid = self.center();
         let min = self.bbox_min;
         let max = self.bbox_max;
@@ -103,7 +134,7 @@ impl Cell {
                 if i & 2 == 0 { mid.y } else { max.y },
                 if i & 4 == 0 { mid.z } else { max.z },
             );
-            Cell::new(child_min, child_max, self.depth.saturating_add(1))
+            Cell::new(child_min, child_max, self.depth.saturating_add(1), seeds[i])
         })
     }
 
@@ -141,27 +172,54 @@ impl Cell {
     }
 
     /// Immutable view of the corner statistics.
-    #[cfg_attr(not(test), allow(dead_code))]
     pub(crate) fn samples(&self) -> &[Stats; 8] {
         &self.samples
     }
 
     /// Mutable view of the corner statistics.
-    #[allow(dead_code)]
     pub(crate) fn samples_mut(&mut self) -> &mut [Stats; 8] {
         &mut self.samples
     }
 
     /// Immutable view of child handles.
-    #[cfg_attr(not(test), allow(dead_code))]
+    #[allow(dead_code)]
     pub(crate) fn children(&self) -> &[Option<Box<Cell>>; 8] {
         &self.children
     }
 
     /// Mutable view of child handles.
-    #[allow(dead_code)]
     pub(crate) fn children_mut(&mut self) -> &mut [Option<Box<Cell>>; 8] {
         &mut self.children
+    }
+
+    /// Immutable view of the center statistics.
+    pub fn center_stats(&self) -> &Stats {
+        &self.center
+    }
+
+    /// Mutable view of the center statistics.
+    pub(crate) fn center_stats_mut(&mut self) -> &mut Stats {
+        &mut self.center
+    }
+
+    /// Mutable access to the cell RNG for sampling.
+    fn rng_mut(&mut self) -> &mut Rng {
+        &mut self.rng
+    }
+
+    /// Re-seed the cell RNG deterministically.
+    pub(crate) fn reset_rng(&mut self, seed: u64) {
+        self.rng = Rng::seed_from(seed);
+    }
+
+    /// Mutable view of corner gradients.
+    pub(crate) fn corner_grads_mut(&mut self) -> &mut [Option<Vec3>; 8] {
+        &mut self.corner_grad
+    }
+
+    /// Mutable view of the center gradient.
+    pub(crate) fn center_grad_mut(&mut self) -> &mut Option<Vec3> {
+        &mut self.center_grad
     }
 }
 
@@ -178,17 +236,35 @@ pub struct IsoParams {
     pub batch_samples: u32,
     /// Walk configuration forwarded to WoS estimators.
     pub walk: WalkBudget,
+    /// Poisson parameters forwarded to estimators.
+    pub poisson: PoissonParams,
+    /// Optional gradient sampling configuration.
+    pub grad: Option<GradParams>,
+    /// Whether to sample the cell center in addition to corners.
+    pub sample_center: bool,
+    /// Global base seed used to derive per-cell RNG seeds.
+    pub base_seed: u64,
 }
 
 impl IsoParams {
     /// Construct a parameter set with explicit variance tolerance and depth.
-    pub fn new(iso_value: f32, variance_tol: f32, max_depth: u8, walk: WalkBudget) -> Self {
+    pub fn new(
+        iso_value: f32,
+        variance_tol: f32,
+        max_depth: u8,
+        walk: WalkBudget,
+        poisson: PoissonParams,
+    ) -> Self {
         Self {
             iso_value,
             variance_tol,
             max_depth,
             batch_samples: 1,
             walk,
+            poisson,
+            grad: None,
+            sample_center: true,
+            base_seed: 0xA5A5_A5A5_1234_5678,
         }
     }
 
@@ -198,6 +274,27 @@ impl IsoParams {
             batch_samples: batch_samples.max(1),
             ..self
         }
+    }
+
+    /// Enable gradient sampling.
+    pub fn with_grad(self, grad: GradParams) -> Self {
+        Self {
+            grad: Some(grad),
+            ..self
+        }
+    }
+
+    /// Disable center sampling (corners only).
+    pub fn without_center_sampling(self) -> Self {
+        Self {
+            sample_center: false,
+            ..self
+        }
+    }
+
+    /// Override the global base seed.
+    pub fn with_base_seed(self, base_seed: u64) -> Self {
+        Self { base_seed, ..self }
     }
 }
 
@@ -211,8 +308,6 @@ pub struct MeshDelta {
 }
 
 /// Scheduler responsible for ordering cells and dispatching sampling batches.
-///
-/// This stub wires the domain and PDE types so later PRs can plug in WoS calls.
 pub struct IsoScheduler<'a, D, A, G, F>
 where
     D: Domain,
@@ -222,13 +317,19 @@ where
 {
     /// Global sampling parameters.
     params: IsoParams,
+    /// Borrowed solver used for value/gradient estimates.
+    solver: &'a Solver<'a, D, A>,
+    /// Dirichlet boundary data.
+    boundary: &'a G,
+    /// Volume source term.
+    source: &'a F,
     /// Storage for all known cells (indexed by queue entries).
     cells: Vec<Cell>,
     /// Priority queue of cell indices.
     queue: BinaryHeap<QueuedCell>,
     /// Monotonic counter to break priority ties.
     seq: u64,
-    /// Marker tying the scheduler to the PDE traits without yet invoking them.
+    /// Marker tying the scheduler to the PDE traits.
     _marker: PhantomData<(&'a Solver<'a, D, A>, &'a G, &'a F)>,
 }
 
@@ -240,12 +341,22 @@ where
     F: SourceTerm,
 {
     /// Create a scheduler seeded with a root cell.
-    pub fn new(params: IsoParams, root: Cell) -> Self {
+    pub fn new(
+        params: IsoParams,
+        mut root: Cell,
+        solver: &'a Solver<'a, D, A>,
+        boundary: &'a G,
+        source: &'a F,
+    ) -> Self {
+        root.reset_rng(params.base_seed);
         let mut cells = Vec::new();
         let queue = BinaryHeap::new();
         cells.push(root);
         let mut sched = Self {
             params,
+            solver,
+            boundary,
+            source,
             cells,
             queue,
             seq: 0,
@@ -265,19 +376,28 @@ where
         self.cells.get(index)
     }
 
-    /// Access a mutable view of a cell by index.
-    pub fn cell_mut(&mut self, index: usize) -> Option<&mut Cell> {
-        self.cells.get_mut(index)
-    }
-
-    /// Placeholder for future WoS sampling; currently just drains the queue.
+    /// Perform one scheduler iteration: sample a cell, update statistics, and refine or requeue.
     ///
-    /// The intention is that later patches will perform sampling, update stats,
-    /// and requeue the cell or its children. Returning `None` indicates no mesh
-    /// output is produced yet.
+    /// Returns an (empty) mesh delta placeholder; later PRs will emit geometry.
     pub fn step(&mut self) -> Option<MeshDelta> {
-        let _ = self.params;
-        self.next_cell().map(|_| MeshDelta::default())
+        let idx = self.next_cell()?;
+        let (sign_change, variance_high, can_subdivide) = self.sample_and_flags(idx);
+
+        let subdivided = if (sign_change || variance_high) && can_subdivide {
+            self.spawn_children(idx);
+            true
+        } else {
+            false
+        };
+
+        if variance_high && !subdivided {
+            self.push_index(idx);
+        }
+        if sign_change && !subdivided && !variance_high {
+            self.push_index(idx);
+        }
+
+        Some(MeshDelta::default())
     }
 
     /// Push children derived from a parent cell into storage and queue.
@@ -290,14 +410,180 @@ where
         })
     }
 
+    /// Push a cell index into the priority queue based on its cached variance.
     fn push_index(&mut self, index: usize) {
-        let variance = self.cells.get(index).map(|c| c.variance).unwrap_or(0.0_f32);
-        let key = PriorityKey::new(variance, self.cells[index].depth, self.seq);
+        let variance = self
+            .cells
+            .get(index)
+            .map(|c| c.variance())
+            .unwrap_or(0.0_f32);
+        let key = PriorityKey::new(variance, self.cells[index].depth(), self.seq);
         self.seq = self.seq.saturating_add(1);
         self.queue.push(QueuedCell {
             key,
             cell_index: index,
         });
+    }
+
+    /// Sample a cell and compute refinement flags in one pass.
+    fn sample_and_flags(&mut self, idx: usize) -> (bool, bool, bool) {
+        // Borrow target cell mutably without aliasing the vector.
+        let (_, tail) = self.cells.split_at_mut(idx);
+        let cell = tail.first_mut().expect("queued index must exist");
+        let params = self.params;
+        let solver = self.solver;
+        let boundary = self.boundary;
+        let source = self.source;
+
+        Self::sample_cell(cell, params, solver, boundary, source);
+        cell.refresh_variance();
+
+        let sign = Self::has_sign_change(cell, params.iso_value, params.sample_center);
+        let variance_high = cell.variance() > params.variance_tol;
+        let can_subdivide = cell.can_subdivide(params.max_depth);
+
+        (sign, variance_high, can_subdivide)
+    }
+
+    /// Sample all corners (and optionally center) once per batch iteration.
+    fn sample_cell(
+        cell: &mut Cell,
+        params: IsoParams,
+        solver: &Solver<'a, D, A>,
+        boundary: &G,
+        source: &F,
+    ) {
+        let corners = cell.corner_positions();
+        for _ in 0..params.batch_samples {
+            for (i, p) in corners.iter().enumerate() {
+                let val = Self::sample_value(cell, *p, params, solver, boundary, source);
+                cell.samples_mut()[i].push(val);
+                if let Some(gradp) = params.grad {
+                    let g = Self::sample_grad(cell, *p, gradp, params, solver, boundary, source);
+                    let count = cell.samples()[i].count().max(1);
+                    Self::accumulate_vec3(&mut cell.corner_grads_mut()[i], count, g);
+                }
+            }
+
+            if params.sample_center {
+                let center_pos = cell.center();
+                let val = Self::sample_value(cell, center_pos, params, solver, boundary, source);
+                cell.center_stats_mut().push(val);
+                if let Some(gradp) = params.grad {
+                    let g = Self::sample_grad(
+                        cell, center_pos, gradp, params, solver, boundary, source,
+                    );
+                    let count = cell.center_stats().count().max(1);
+                    Self::accumulate_vec3(cell.center_grad_mut(), count, g);
+                }
+            }
+        }
+    }
+
+    /// Single value sample via the Poisson Dirichlet estimator.
+    fn sample_value(
+        cell: &mut Cell,
+        p: Vec3,
+        params: IsoParams,
+        solver: &Solver<'a, D, A>,
+        boundary: &G,
+        source: &F,
+    ) -> f32 {
+        solver.poisson_dirichlet(
+            boundary,
+            source,
+            params.walk,
+            params.poisson,
+            cell.rng_mut(),
+            p,
+        )
+    }
+
+    /// Optional gradient sample via the Poisson gradient estimator.
+    fn sample_grad(
+        cell: &mut Cell,
+        p: Vec3,
+        grad: GradParams,
+        params: IsoParams,
+        solver: &Solver<'a, D, A>,
+        boundary: &G,
+        source: &F,
+    ) -> Vec3 {
+        solver.poisson_gradient(
+            boundary,
+            source,
+            params.walk,
+            params.poisson,
+            grad,
+            cell.rng_mut(),
+            p,
+        )
+    }
+
+    /// Detect whether the current statistics cross the iso-value.
+    fn has_sign_change(cell: &Cell, iso: f32, include_center: bool) -> bool {
+        let mut min_v = f32::INFINITY;
+        let mut max_v = f32::NEG_INFINITY;
+        let mut seen = false;
+
+        for s in cell.samples().iter() {
+            if s.count() > 0 {
+                seen = true;
+                min_v = min_v.min(s.mean());
+                max_v = max_v.max(s.mean());
+            }
+        }
+
+        if include_center && cell.center_stats().count() > 0 {
+            seen = true;
+            min_v = min_v.min(cell.center_stats().mean());
+            max_v = max_v.max(cell.center_stats().mean());
+        }
+
+        seen && min_v <= iso && max_v >= iso && (min_v < iso || max_v > iso)
+    }
+
+    /// Subdivide a cell and enqueue its children with deterministic seeds.
+    fn spawn_children(&mut self, parent_index: usize) {
+        let base_seed = self.params.base_seed;
+        let seeds = core::array::from_fn(|i| Self::child_seed(base_seed, parent_index, i as u8));
+
+        let children = {
+            let parent = self
+                .cells
+                .get(parent_index)
+                .expect("parent must exist")
+                .clone();
+            parent.subdivide_with_seeds(seeds)
+        };
+
+        if let Some(parent) = self.cells.get_mut(parent_index) {
+            let cloned = core::array::from_fn(|i| Some(Box::new(children[i].clone())));
+            *parent.children_mut() = cloned;
+        }
+
+        self.enqueue_children(&children);
+    }
+
+    /// Combine base seed, parent index, and child id to produce a per-child seed.
+    fn child_seed(base: u64, parent_index: usize, child: u8) -> u64 {
+        let mix = (parent_index as u64).wrapping_mul(0x9E37_79B9_7F4A_7C15)
+            ^ ((child as u64) << 32)
+            ^ base;
+        mix ^ 0xD1B5_4A32_D192_ED03
+    }
+
+    /// Incremental mean update for gradients.
+    fn accumulate_vec3(slot: &mut Option<Vec3>, count: u32, sample: Vec3) {
+        let c = count as f32;
+        match slot {
+            Some(mean) => {
+                *mean = (*mean * (c - 1.0) + sample) / c;
+            }
+            None => {
+                *slot = Some(sample);
+            }
+        }
     }
 }
 
@@ -374,9 +660,14 @@ impl PartialOrd for QueuedCell {
 mod tests {
     use super::*;
 
-    /// Helper to build a unit cube root cell.
+    /// Helper to build a unit cube root cell with a fixed seed.
     fn root_cell() -> Cell {
-        Cell::new(Vec3::new(0.0, 0.0, 0.0), Vec3::new(1.0, 1.0, 1.0), 0)
+        Cell::new(
+            Vec3::new(0.0, 0.0, 0.0),
+            Vec3::new(1.0, 1.0, 1.0),
+            0,
+            0xDEAD_BEEF,
+        )
     }
 
     #[test]
@@ -388,17 +679,32 @@ mod tests {
         let mut c = root_cell();
         c.set_variance(0.5);
         c.set_depth(2);
-        a.set_last_touched(42);
-        assert_eq!(a.last_touched(), 42);
-        assert_eq!(a.samples().len(), 8);
-        assert_eq!(a.children().len(), 8);
 
-        let params = IsoParams::new(0.0, 0.01, 4, WalkBudget::new(1e-3, 16));
+        fn phi(p: Vec3) -> f32 {
+            p.length() - 2.0
+        }
+        fn g0(_p: Vec3) -> f32 {
+            0.0
+        }
+        let domain: crate::SdfDomain<fn(Vec3) -> f32> = crate::SdfDomain::new(phi);
+        let accel = crate::ClosestNaive;
+        let solver = crate::Solver::builder(&domain, &accel).build();
+        let boundary = crate::BoundaryDirichletFn::new(g0 as fn(Vec3) -> f32);
+        let source = ZeroSource;
+
+        let params = IsoParams::new(
+            0.0,
+            0.01,
+            4,
+            WalkBudget::new(1e-3, 16),
+            PoissonParams::new(1),
+        );
         type TD = crate::SdfDomain<fn(Vec3) -> f32>;
         type TA = crate::ClosestNaive;
         type TB = crate::BoundaryDirichletFn<fn(Vec3) -> f32>;
-        type TS = crate::PointSource;
-        let mut sched: IsoScheduler<'static, TD, TA, TB, TS> = IsoScheduler::new(params, a);
+        type TS = ZeroSource;
+        let mut sched: IsoScheduler<'_, TD, TA, TB, TS> =
+            IsoScheduler::new(params, a, &solver, &boundary, &source);
 
         // Push extra cells manually to test ordering.
         sched.cells.push(b);
@@ -421,7 +727,8 @@ mod tests {
     #[test]
     fn cell_subdivide_splits_bounds() {
         let cell = root_cell();
-        let children = cell.subdivide();
+        let seeds = core::array::from_fn(|i| i as u64 + 1);
+        let children = cell.subdivide_with_seeds(seeds);
         for (i, child) in children.iter().enumerate() {
             assert_eq!(child.depth(), 1);
             let mid = cell.center();
@@ -451,6 +758,70 @@ mod tests {
                     || (max.x - mid.x).abs() < 1e-6
                     || (max.x - cell.bbox_max().x).abs() < 1e-6
             );
+            assert!(
+                (min.y - cell.bbox_min().y).abs() < 1e-6
+                    || (min.y - mid.y).abs() < 1e-6
+                    || (min.y - cell.bbox_max().y).abs() < 1e-6
+            );
+        }
+    }
+
+    #[test]
+    fn step_updates_stats_and_requeues_when_variance_high() {
+        fn phi(p: Vec3) -> f32 {
+            p.length() - 2.0
+        }
+        fn g0(_p: Vec3) -> f32 {
+            0.0
+        }
+        let domain: crate::SdfDomain<fn(Vec3) -> f32> = crate::SdfDomain::new(phi);
+        let accel = crate::ClosestNaive;
+        let solver = crate::Solver::builder(&domain, &accel).build();
+        let boundary = crate::BoundaryDirichletFn::new(g0 as fn(Vec3) -> f32);
+        let source = ZeroSource;
+
+        let root = Cell::new(
+            Vec3::new(-0.5, -0.5, -0.5),
+            Vec3::new(0.5, 0.5, 0.5),
+            0,
+            0xCAFEBABE,
+        );
+        // Negative tolerance guarantees variance_high=true after sampling.
+        let params = IsoParams::new(
+            0.0,
+            -1.0,
+            1,
+            WalkBudget::new(1e-3, 8),
+            PoissonParams::new(1),
+        )
+        .with_batch_samples(2)
+        .with_base_seed(0xBEEFBEEF);
+
+        let mut sched = IsoScheduler::new(params, root, &solver, &boundary, &source);
+        let _ = sched.step();
+
+        let cell = sched.cell(0).unwrap();
+        assert!(
+            cell.samples().iter().all(|s| s.count() >= 2),
+            "all corners should receive samples"
+        );
+        assert!(
+            cell.center_stats().count() >= 2,
+            "center should receive samples when enabled"
+        );
+        // Variance high forced requeue; queue should not be empty.
+        assert!(
+            !sched.queue.is_empty(),
+            "variance trigger should requeue when not subdividing"
+        );
+    }
+
+    /// Constant zero source used in tests.
+    #[derive(Clone, Copy)]
+    struct ZeroSource;
+    impl SourceTerm for ZeroSource {
+        fn value(&self, _x: Vec3) -> f32 {
+            0.0
         }
     }
 }

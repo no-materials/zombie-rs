@@ -4,7 +4,7 @@
 ///
 /// - `no_std` friendly.
 /// - Not cryptographically secure.
-#[derive(Clone)]
+#[derive(Clone, Debug)]
 pub struct XorShift64 {
     state: u64,
 }
