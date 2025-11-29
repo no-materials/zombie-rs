@@ -580,31 +580,61 @@ where
     /// Perform one scheduler iteration: sample a cell, update statistics, and refine or requeue.
     /// Also mesh converged cells using `mesher`.
     pub fn step(&mut self, mesher: &Mesher) -> Option<MeshDelta> {
-        let idx = self.next_cell()?;
-        let flags = self.sample_and_flags(idx);
+        self.step_batch(mesher, Some(1))
+    }
 
-        let subdivided = if (flags.sign_change || flags.variance_high) && flags.can_subdivide {
-            self.spawn_children(idx);
-            true
-        } else {
-            false
-        };
+    /// Process up to `max_cells` (or the whole queue if `None`), meshing converged cells
+    /// and concatenating their geometry into a single `MeshDelta`.
+    ///
+    /// This is useful for stitching per-frame batches without imposing a global vertex
+    /// deduplication policy. Indices are offset internally so callers can append the
+    /// returned `MeshDelta` directly to their accumulated mesh.
+    pub fn step_batch(&mut self, mesher: &Mesher, max_cells: Option<usize>) -> Option<MeshDelta> {
+        let mut processed = 0usize;
+        let mut accum = MeshDelta::default();
 
-        if !flags.converged {
-            if flags.variance_high && !subdivided {
-                self.push_index(idx);
-            } else if flags.sign_change && !subdivided && !flags.variance_high {
-                self.push_index(idx);
+        while max_cells.map_or(true, |limit| processed < limit) {
+            // Dequeue the next cell to process.
+            let Some(idx) = self.next_cell() else {
+                break;
+            };
+            // Sample and compute refinement flags.
+            let flags = self.sample_and_flags(idx);
+
+            // Subdivide cells that need refinement.
+            let subdivided = if (flags.sign_change || flags.variance_high) && flags.can_subdivide {
+                self.spawn_children(idx);
+                true
+            } else {
+                false
+            };
+
+            // Requeue non-converged cells that were not subdivided.
+            if !flags.converged {
+                if flags.variance_high && !subdivided {
+                    self.push_index(idx);
+                } else if flags.sign_change && !subdivided && !flags.variance_high {
+                    self.push_index(idx);
+                }
             }
+
+            // Mesh converged cells.
+            if flags.converged {
+                let delta = self.mesh_ready_cell(idx, mesher);
+                let base = accum.vertices.len() as u32;
+                accum.indices.extend(
+                    delta
+                        .indices
+                        .into_iter()
+                        .map(|[a, b, c]| [a + base, b + base, c + base]),
+                );
+                accum.vertices.extend(delta.vertices);
+            }
+
+            processed = processed.saturating_add(1);
         }
 
-        let mesh = if flags.converged {
-            self.mesh_ready_cell(idx, mesher)
-        } else {
-            MeshDelta::default()
-        };
-
-        Some(mesh)
+        if processed == 0 { None } else { Some(accum) }
     }
 
     /// Push children derived from a parent cell into storage and queue.
@@ -1228,11 +1258,7 @@ mod tests {
             .cloned()
             .filter(|c| cell_straddles(c, sdf, iso))
             .collect();
-        if band.is_empty() {
-            frontier
-        } else {
-            band
-        }
+        if band.is_empty() { frontier } else { band }
     }
 
     /// Signed distance to a sphere of radius `r` at the origin.
@@ -1406,6 +1432,93 @@ mod tests {
             "torus vertices should stay close to the implicit surface (max dist {max_dist})"
         );
         assert!(outward_ok, "winding not checked; should remain true");
+    }
+
+    #[test]
+    fn batch_meshing_matches_single_steps() {
+        fn phi(p: Vec3) -> f32 {
+            p.length() - 1.0
+        }
+        fn g_x(p: Vec3) -> f32 {
+            p.x
+        }
+
+        let domain: crate::SdfDomain<fn(Vec3) -> f32> = crate::SdfDomain::new(phi);
+        let accel = crate::ClosestNaive;
+        let solver = crate::Solver::builder(&domain, &accel).build();
+        let boundary = crate::BoundaryDirichletFn::new(g_x as fn(Vec3) -> f32);
+        let source = ZeroSource;
+
+        let root_a = Cell::new(
+            Vec3::new(-0.5, -0.5, -0.5),
+            Vec3::new(0.5, 0.5, 0.5),
+            0,
+            0xBABA_CAFE,
+        );
+        let root_b = root_a.clone();
+
+        let params = IsoParams::new(
+            -0.25,
+            -1.0,
+            2,
+            WalkBudget::new(1e-3, 8),
+            PoissonParams::new(1),
+        )
+        .with_batch_samples(2)
+        .with_base_seed(0x1234_5678_ABCD);
+
+        type TD = crate::SdfDomain<fn(Vec3) -> f32>;
+        type TA = crate::ClosestNaive;
+        type TB = crate::BoundaryDirichletFn<fn(Vec3) -> f32>;
+        type TS = ZeroSource;
+
+        let mesher = Mesher::new(params.iso_value);
+
+        let mut sched_batch: IsoScheduler<'_, TD, TA, TB, TS> =
+            IsoScheduler::new(params, root_a, &solver, &boundary, &source);
+        let batch_delta = sched_batch
+            .step_batch(&mesher, None)
+            .expect("batch step should process at least one cell");
+        assert!(
+            sched_batch.next_cell().is_none(),
+            "batch step should drain the queue when no limit is given"
+        );
+
+        let mut sched_single: IsoScheduler<'_, TD, TA, TB, TS> =
+            IsoScheduler::new(params, root_b, &solver, &boundary, &source);
+        let mut accum = MeshDelta::default();
+        while let Some(delta) = sched_single.step(&mesher) {
+            let base = accum.vertices.len() as u32;
+            accum.indices.extend(
+                delta
+                    .indices
+                    .into_iter()
+                    .map(|[a, b, c]| [a + base, b + base, c + base]),
+            );
+            accum.vertices.extend(delta.vertices);
+        }
+
+        assert_eq!(
+            accum.vertices.len(),
+            batch_delta.vertices.len(),
+            "batch and single-step paths should yield identical vertex counts"
+        );
+        assert_eq!(
+            accum.indices.len(),
+            batch_delta.indices.len(),
+            "batch and single-step paths should yield identical triangle counts"
+        );
+        assert_eq!(accum.vertices, batch_delta.vertices);
+        assert_eq!(accum.indices, batch_delta.indices);
+
+        let vlen = accum.vertices.len() as u32;
+        assert!(
+            accum
+                .indices
+                .iter()
+                .all(|tri| tri[0] < vlen && tri[1] < vlen && tri[2] < vlen),
+            "indices must remain in-bounds after accumulation"
+        );
     }
 
     /// Constant zero source used in tests.
