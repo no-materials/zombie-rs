@@ -397,16 +397,39 @@ impl Mesher {
                 }
             }
 
+            // Cheap centroid gradient estimate to orient triangles when gradients are present.
+            let g_centroid = tg
+                .iter()
+                .flatten()
+                .fold((Vec3::new(0.0, 0.0, 0.0), 0u32), |(acc, n), g| {
+                    (acc + *g, n.saturating_add(1))
+                });
+            let g_centroid = if g_centroid.1 > 0 {
+                Some(g_centroid.0 / g_centroid.1 as f32)
+            } else {
+                None
+            };
+
             let mask = self.tet_mask(&tv);
             for tri in Self::tet_tris(mask) {
-                let mut idx = [0u32; 3];
+                let mut tri_pts = [Vec3::default(); 3];
                 for (k, &edge_id) in tri.iter().enumerate() {
                     let (c0, c1) = TET_EDGES[edge_id as usize];
                     let p = self.edge_point(tp[c0], tv[c0], tg[c0], tp[c1], tv[c1], tg[c1]);
-                    idx[k] = vertices.len() as u32;
-                    vertices.push(p);
+                    tri_pts[k] = p;
                 }
-                indices.push(idx);
+
+                // Orient the triangle outward if a centroid gradient is available.
+                if let Some(g) = g_centroid {
+                    let n = (tri_pts[1] - tri_pts[0]).cross(tri_pts[2] - tri_pts[0]);
+                    if n.dot(g) < 0.0 {
+                        tri_pts.swap(1, 2);
+                    }
+                }
+
+                let base = vertices.len() as u32;
+                vertices.extend_from_slice(&tri_pts);
+                indices.push([base, base + 1, base + 2]);
             }
         }
 
@@ -909,6 +932,7 @@ const TET_TRI_TABLE_NEG: [&[[i8; 3]]; 8] = [
 #[cfg(test)]
 mod tests {
     use super::*;
+    use alloc::vec;
 
     /// Helper to build a unit cube root cell with a fixed seed.
     fn root_cell() -> Cell {
@@ -1151,6 +1175,237 @@ mod tests {
             sched.next_cell().is_none(),
             "converged cell at max depth should not be requeued"
         );
+    }
+
+    /// Predicate: returns true when the cell corners (or center) straddle the iso-value.
+    fn cell_straddles<F>(cell: &Cell, sdf: F, iso: f32) -> bool
+    where
+        F: Fn(Vec3) -> f32,
+    {
+        let positions = cell.corner_positions();
+        let mut min_v = f32::INFINITY;
+        let mut max_v = f32::NEG_INFINITY;
+        for p in positions.iter() {
+            let v = sdf(*p);
+            min_v = min_v.min(v);
+            max_v = max_v.max(v);
+        }
+        let center_v = sdf(cell.center());
+        min_v = min_v.min(center_v);
+        max_v = max_v.max(center_v);
+        min_v <= iso && max_v >= iso && (min_v < iso || max_v > iso)
+    }
+
+    /// Adaptively refine only cells that straddle the iso-surface, up to `target_depth`.
+    fn narrow_band_cells<F>(root: Cell, target_depth: u8, sdf: F, iso: f32) -> Vec<Cell>
+    where
+        F: Fn(Vec3) -> f32 + Copy,
+    {
+        let mut frontier = vec![root];
+        let mut seed_counter = 1u64;
+        let free_levels = core::cmp::min(3, target_depth);
+        for level in 0..target_depth {
+            let mut next = Vec::new();
+            for cell in frontier.into_iter() {
+                // Always expand the root (level 0) to avoid missing enclosed features
+                // such as torus holes whose corners and center may all have the same sign.
+                if level >= free_levels && !cell_straddles(&cell, sdf, iso) {
+                    continue;
+                }
+                let seeds = core::array::from_fn(|_| {
+                    let s = seed_counter;
+                    seed_counter = seed_counter.saturating_add(1);
+                    s
+                });
+                let children = cell.subdivide_with_seeds(seeds);
+                next.extend(children.into_iter());
+            }
+            frontier = next;
+        }
+
+        let band: Vec<Cell> = frontier
+            .iter()
+            .cloned()
+            .filter(|c| cell_straddles(c, sdf, iso))
+            .collect();
+        if band.is_empty() {
+            frontier
+        } else {
+            band
+        }
+    }
+
+    /// Signed distance to a sphere of radius `r` at the origin.
+    fn sphere_sdf(p: Vec3, r: f32) -> f32 {
+        p.length() - r
+    }
+
+    /// Outward gradient for the sphere SDF; returns zero at the origin.
+    fn sphere_grad(p: Vec3) -> Vec3 {
+        let len = p.length();
+        if len > 1e-6 {
+            p / len
+        } else {
+            Vec3::new(0.0, 0.0, 0.0)
+        }
+    }
+
+    /// Signed distance to an axis-aligned box centered at the origin with half-extent `h`.
+    fn box_sdf(p: Vec3, h: f32) -> f32 {
+        let q = p.abs() - Vec3::new(h, h, h);
+        let outside = Vec3::new(q.x.max(0.0), q.y.max(0.0), q.z.max(0.0));
+        let outside_len = outside.length();
+        let inside = q.x.max(q.y.max(q.z)).min(0.0);
+        outside_len + inside
+    }
+
+    /// Signed distance to a torus centered at origin lying in the XZ plane.
+    fn torus_sdf(p: Vec3, major: f32, minor: f32) -> f32 {
+        let w = Vec3::new(p.x, 0.0, p.z);
+        let q = Vec3::new(w.length() - major, p.y, 0.0);
+        q.length() - minor
+    }
+
+    /// Gradient of the torus SDF; returns an arbitrary up-vector when degenerate.
+    fn torus_grad(p: Vec3, major: f32) -> Vec3 {
+        let w = Vec3::new(p.x, 0.0, p.z);
+        let len_w = w.length();
+        let qx = len_w - major;
+        let q = Vec3::new(qx, p.y, 0.0);
+        let len_q = q.length();
+        if len_q < 1e-6 || len_w < 1e-6 {
+            return Vec3::new(0.0, 1.0, 0.0);
+        }
+        let inv_q = 1.0 / len_q;
+        let inv_w = 1.0 / len_w;
+        let dqx_dx = w.x * inv_w;
+        let dqx_dz = w.z * inv_w;
+        Vec3::new(qx * dqx_dx * inv_q, q.y * inv_q, qx * dqx_dz * inv_q)
+    }
+
+    /// Mesh a batch of cells and return the maximum vertex distance to the target surface.
+    /// Optionally checks triangle winding against an outward gradient field.
+    fn mesh_error_for_cells<F, G>(
+        cells: &[Cell],
+        mesher: &Mesher,
+        sdf: F,
+        grad: Option<G>,
+        check_winding: bool,
+    ) -> (f32, bool)
+    where
+        F: Fn(Vec3) -> f32,
+        G: Fn(Vec3) -> Vec3,
+    {
+        let mut max_dist = 0.0_f32;
+        let mut outward_ok = true;
+
+        for cell in cells {
+            let positions = cell.corner_positions();
+            let values = core::array::from_fn(|i| sdf(positions[i]));
+            let gradients = match grad.as_ref() {
+                Some(g) => Some(core::array::from_fn(|i| Some(g(positions[i])))),
+                None => None,
+            };
+
+            let delta = mesher.mesh_cell(values, gradients, positions);
+            for &v in delta.vertices.iter() {
+                max_dist = max_dist.max(sdf(v).abs());
+            }
+
+            if check_winding {
+                for tri in delta.indices.iter() {
+                    let p0 = delta.vertices[tri[0] as usize];
+                    let p1 = delta.vertices[tri[1] as usize];
+                    let p2 = delta.vertices[tri[2] as usize];
+                    let n = (p1 - p0).cross(p2 - p0);
+                    if n.length() < 1e-8 {
+                        continue;
+                    }
+                    let centroid = (p0 + p1 + p2) / 3.0;
+                    let grad_dir = grad.as_ref().map(|g| g(centroid)).unwrap_or(centroid);
+                    if n.dot(grad_dir) < -1e-5 {
+                        outward_ok = false;
+                        break;
+                    }
+                }
+            }
+        }
+
+        (max_dist, outward_ok)
+    }
+
+    #[test]
+    fn mesher_sphere_vertices_close_and_outward() {
+        let root = Cell::new(Vec3::new(-1.1, -1.1, -1.1), Vec3::new(1.1, 1.1, 1.1), 0, 42);
+        let cells = narrow_band_cells(root, 8, |p| sphere_sdf(p, 1.0), 0.0);
+        let mesher = Mesher::new(0.0);
+
+        assert!(!cells.is_empty(),);
+
+        let (max_dist, outward_ok) = mesh_error_for_cells(
+            &cells,
+            &mesher,
+            |p| sphere_sdf(p, 1.0),
+            Some(sphere_grad),
+            true,
+        );
+
+        assert!(
+            max_dist < 1e-2,
+            "sphere vertices should hug the surface (max dist {max_dist})"
+        );
+        assert!(outward_ok, "triangle winding should point outward");
+    }
+
+    #[test]
+    fn mesher_box_vertices_close() {
+        let root = Cell::new(
+            Vec3::new(-1.05, -1.05, -1.05),
+            Vec3::new(1.05, 1.05, 1.05),
+            0,
+            7,
+        );
+        let cells = narrow_band_cells(root, 8, |p| box_sdf(p, 1.0), 0.0);
+        let mesher = Mesher::new(0.0);
+
+        assert!(!cells.is_empty(),);
+
+        let (max_dist, outward_ok) = mesh_error_for_cells(
+            &cells,
+            &mesher,
+            |p| box_sdf(p, 1.0),
+            None::<fn(Vec3) -> Vec3>,
+            false,
+        );
+
+        assert!(
+            max_dist < 1e-2,
+            "box vertices should stay close to the implicit surface (max dist {max_dist})"
+        );
+        assert!(outward_ok, "winding not checked; should remain true");
+    }
+
+    #[test]
+    fn mesher_torus_vertices_close() {
+        let root = Cell::new(Vec3::new(-1.1, -1.1, -1.1), Vec3::new(1.1, 1.1, 1.1), 0, 9);
+        let cells = narrow_band_cells(root, 7, |p| torus_sdf(p, 0.75, 0.25), 0.0);
+        let mesher = Mesher::new(0.0);
+
+        assert!(!cells.is_empty(),);
+
+        let (max_dist, outward_ok) = mesh_error_for_cells(
+            &cells,
+            &mesher,
+            |p| torus_sdf(p, 0.75, 0.25),
+            Some(|p| torus_grad(p, 0.75)),
+            false,
+        );
+
+        assert!(
+            max_dist < 2e-2,
+            "torus vertices should stay close to the implicit surface (max dist {max_dist})"
+        );
+        assert!(outward_ok, "winding not checked; should remain true");
     }
 
     /// Constant zero source used in tests.
