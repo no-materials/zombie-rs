@@ -1003,12 +1003,7 @@ mod tests {
             WalkBudget::new(1e-3, 16),
             PoissonParams::new(1),
         );
-        type TD = crate::SdfDomain<fn(Vec3) -> f32>;
-        type TA = crate::ClosestNaive;
-        type TB = crate::BoundaryDirichletFn<fn(Vec3) -> f32>;
-        type TS = ZeroSource;
-        let mut sched: IsoScheduler<'_, TD, TA, TB, TS> =
-            IsoScheduler::new(params, a, &solver, &boundary, &source);
+        let mut sched = IsoScheduler::new(params, a, &solver, &boundary, &source);
 
         // Push extra cells manually to test ordering.
         sched.cells.push(b);
@@ -1189,12 +1184,7 @@ mod tests {
         );
         let mesher = Mesher::new(params.iso_value);
 
-        type TD = crate::SdfDomain<fn(Vec3) -> f32>;
-        type TA = crate::ClosestNaive;
-        type TB = crate::BoundaryDirichletFn<fn(Vec3) -> f32>;
-        type TS = ZeroSource;
-        let mut sched: IsoScheduler<'_, TD, TA, TB, TS> =
-            IsoScheduler::new(params, root, &solver, &boundary, &source);
+        let mut sched = IsoScheduler::new(params, root, &solver, &boundary, &source);
 
         let delta = sched.step(&mesher).expect("root cell should exist");
         assert!(
@@ -1467,15 +1457,9 @@ mod tests {
         .with_batch_samples(2)
         .with_base_seed(0x1234_5678_ABCD);
 
-        type TD = crate::SdfDomain<fn(Vec3) -> f32>;
-        type TA = crate::ClosestNaive;
-        type TB = crate::BoundaryDirichletFn<fn(Vec3) -> f32>;
-        type TS = ZeroSource;
-
         let mesher = Mesher::new(params.iso_value);
 
-        let mut sched_batch: IsoScheduler<'_, TD, TA, TB, TS> =
-            IsoScheduler::new(params, root_a, &solver, &boundary, &source);
+        let mut sched_batch = IsoScheduler::new(params, root_a, &solver, &boundary, &source);
         let batch_delta = sched_batch
             .step_batch(&mesher, None)
             .expect("batch step should process at least one cell");
@@ -1484,8 +1468,7 @@ mod tests {
             "batch step should drain the queue when no limit is given"
         );
 
-        let mut sched_single: IsoScheduler<'_, TD, TA, TB, TS> =
-            IsoScheduler::new(params, root_b, &solver, &boundary, &source);
+        let mut sched_single = IsoScheduler::new(params, root_b, &solver, &boundary, &source);
         let mut accum = MeshDelta::default();
         while let Some(delta) = sched_single.step(&mesher) {
             let base = accum.vertices.len() as u32;
