@@ -2,9 +2,9 @@
 //!
 //! This module implements the sampling core for progressive isosurface extraction.
 //! Cells are refined based on variance or detected sign-changes of the sampled
-//! field, using Monte Carlo estimators from the existing `Solver` API. Meshing
-//! is intentionally deferred to later PRs; this file focuses on deterministic
-//! sampling, statistics accumulation, and refinement scheduling.
+//! field, using Monte Carlo estimators from the existing `Solver` API. A small
+//! mesher is provided that consumes converged cells, but meshing is kept
+//! decoupled from scheduling so sampling can be driven independently.
 
 extern crate alloc;
 
@@ -113,6 +113,27 @@ impl Cell {
             .fold(self.center.var(), |acc, s| acc.max(s.var()));
     }
 
+    /// Return `true` when the cell has been sampled at least once.
+    fn has_samples(&self, include_center: bool) -> bool {
+        let mut seen = self.samples.iter().any(|s| s.count() > 0);
+        if include_center {
+            seen |= self.center.count() > 0;
+        }
+        seen
+    }
+
+    /// Return `true` when sampling has converged or the cell cannot be subdivided.
+    ///
+    /// Convergence requires at least one sample; a cell at `max_depth` is also
+    /// treated as converged even if its variance is still above tolerance because
+    /// no further refinement is possible.
+    pub fn is_converged(&self, params: &IsoParams) -> bool {
+        if !self.has_samples(params.sample_center) {
+            return false;
+        }
+        self.variance() <= params.variance_tol || !self.can_subdivide(params.max_depth)
+    }
+
     /// Return `true` when the cell can be split.
     pub fn can_subdivide(&self, max_depth: u8) -> bool {
         self.depth < max_depth
@@ -176,6 +197,11 @@ impl Cell {
         &self.samples
     }
 
+    /// Copy out corner means for meshing or diagnostics.
+    pub(crate) fn corner_means(&self) -> [f32; 8] {
+        core::array::from_fn(|i| self.samples[i].mean())
+    }
+
     /// Mutable view of the corner statistics.
     pub(crate) fn samples_mut(&mut self) -> &mut [Stats; 8] {
         &mut self.samples
@@ -215,6 +241,11 @@ impl Cell {
     /// Mutable view of corner gradients.
     pub(crate) fn corner_grads_mut(&mut self) -> &mut [Option<Vec3>; 8] {
         &mut self.corner_grad
+    }
+
+    /// Copy out corner gradients (if any have been accumulated).
+    pub(crate) fn corner_grads(&self) -> [Option<Vec3>; 8] {
+        self.corner_grad
     }
 
     /// Mutable view of the center gradient.
@@ -298,7 +329,7 @@ impl IsoParams {
     }
 }
 
-/// Incremental mesh delta placeholder (meshing arrives in later PRs).
+/// Incremental mesh delta emitted per-cell by the mesher/scheduler.
 #[derive(Clone, Debug, Default)]
 pub struct MeshDelta {
     /// Vertex positions emitted by a scheduler iteration.
@@ -467,6 +498,19 @@ where
     _marker: PhantomData<(&'a Solver<'a, D, A>, &'a G, &'a F)>,
 }
 
+/// Refinement and convergence flags derived after sampling a cell.
+#[derive(Copy, Clone, Debug)]
+struct StepFlags {
+    /// Whether the current samples straddle the iso-value.
+    sign_change: bool,
+    /// Whether the cached variance exceeds tolerance.
+    variance_high: bool,
+    /// Whether the cell can still be subdivided.
+    can_subdivide: bool,
+    /// Whether the cell is converged (variance low or depth capped).
+    converged: bool,
+}
+
 impl<'a, D, A, G, F> IsoScheduler<'a, D, A, G, F>
 where
     D: Domain,
@@ -511,27 +555,33 @@ where
     }
 
     /// Perform one scheduler iteration: sample a cell, update statistics, and refine or requeue.
-    ///
-    /// Returns an (empty) mesh delta placeholder; later PRs will emit geometry.
-    pub fn step(&mut self) -> Option<MeshDelta> {
+    /// Also mesh converged cells using `mesher`.
+    pub fn step(&mut self, mesher: &Mesher) -> Option<MeshDelta> {
         let idx = self.next_cell()?;
-        let (sign_change, variance_high, can_subdivide) = self.sample_and_flags(idx);
+        let flags = self.sample_and_flags(idx);
 
-        let subdivided = if (sign_change || variance_high) && can_subdivide {
+        let subdivided = if (flags.sign_change || flags.variance_high) && flags.can_subdivide {
             self.spawn_children(idx);
             true
         } else {
             false
         };
 
-        if variance_high && !subdivided {
-            self.push_index(idx);
-        }
-        if sign_change && !subdivided && !variance_high {
-            self.push_index(idx);
+        if !flags.converged {
+            if flags.variance_high && !subdivided {
+                self.push_index(idx);
+            } else if flags.sign_change && !subdivided && !flags.variance_high {
+                self.push_index(idx);
+            }
         }
 
-        Some(MeshDelta::default())
+        let mesh = if flags.converged {
+            self.mesh_ready_cell(idx, mesher)
+        } else {
+            MeshDelta::default()
+        };
+
+        Some(mesh)
     }
 
     /// Push children derived from a parent cell into storage and queue.
@@ -560,7 +610,7 @@ where
     }
 
     /// Sample a cell and compute refinement flags in one pass.
-    fn sample_and_flags(&mut self, idx: usize) -> (bool, bool, bool) {
+    fn sample_and_flags(&mut self, idx: usize) -> StepFlags {
         // Borrow target cell mutably without aliasing the vector.
         let (_, tail) = self.cells.split_at_mut(idx);
         let cell = tail.first_mut().expect("queued index must exist");
@@ -575,8 +625,14 @@ where
         let sign = Self::has_sign_change(cell, params.iso_value, params.sample_center);
         let variance_high = cell.variance() > params.variance_tol;
         let can_subdivide = cell.can_subdivide(params.max_depth);
+        let converged = cell.is_converged(&params);
 
-        (sign, variance_high, can_subdivide)
+        StepFlags {
+            sign_change: sign,
+            variance_high,
+            can_subdivide,
+            converged,
+        }
     }
 
     /// Sample all corners (and optionally center) once per batch iteration.
@@ -697,6 +753,29 @@ where
         }
 
         self.enqueue_children(&children);
+    }
+
+    /// Mesh a converged cell into a `MeshDelta`, cloning only the minimal data.
+    fn mesh_ready_cell(&self, index: usize, mesher: &Mesher) -> MeshDelta {
+        let cell = self
+            .cells
+            .get(index)
+            .expect("cell index must exist during meshing");
+        debug_assert!(
+            cell.is_converged(&self.params),
+            "meshing should be gated on convergence"
+        );
+
+        let positions = cell.corner_positions();
+        let values = cell.corner_means();
+        let grads = cell.corner_grads();
+        let gradients = if grads.iter().any(|g| g.is_some()) {
+            Some(grads)
+        } else {
+            None
+        };
+
+        mesher.mesh_cell(values, gradients, positions)
     }
 
     /// Combine base seed, parent index, and child id to produce a per-child seed.
@@ -967,9 +1046,10 @@ mod tests {
         )
         .with_batch_samples(2)
         .with_base_seed(0xBEEFBEEF);
+        let mesher = Mesher::new(params.iso_value);
 
         let mut sched = IsoScheduler::new(params, root, &solver, &boundary, &source);
-        let _ = sched.step();
+        let _ = sched.step(&mesher);
 
         let cell = sched.cell(0).unwrap();
         assert!(
@@ -984,6 +1064,92 @@ mod tests {
         assert!(
             !sched.queue.is_empty(),
             "variance trigger should requeue when not subdividing"
+        );
+    }
+
+    #[test]
+    fn cell_convergence_requires_samples_and_depth_or_variance() {
+        let mut cell = root_cell();
+        let params = IsoParams::new(
+            0.0,
+            0.01,
+            1,
+            WalkBudget::new(1e-3, 8),
+            PoissonParams::new(1),
+        );
+
+        assert!(
+            !cell.is_converged(&params),
+            "unsampled cell should not report convergence"
+        );
+
+        // Seed minimal samples to make the variance calculation meaningful.
+        for s in cell.samples_mut().iter_mut() {
+            s.push(0.5);
+        }
+        cell.center_stats_mut().push(0.25);
+        cell.refresh_variance();
+        assert!(
+            cell.is_converged(&params),
+            "low-variance cell with samples should converge"
+        );
+
+        // Force high variance but clamp depth to max_depth so it still converges.
+        cell.set_variance(10.0);
+        cell.set_depth(params.max_depth);
+        assert!(
+            cell.is_converged(&params),
+            "depth-capped cell should count as converged even with high variance"
+        );
+    }
+
+    #[test]
+    fn converged_max_depth_meshes_once() {
+        fn phi(p: Vec3) -> f32 {
+            p.length() - 1.0
+        }
+        fn g0(_p: Vec3) -> f32 {
+            0.0
+        }
+
+        let domain: crate::SdfDomain<fn(Vec3) -> f32> = crate::SdfDomain::new(phi);
+        let accel = crate::ClosestNaive;
+        let solver = crate::Solver::builder(&domain, &accel).build();
+        let boundary = crate::BoundaryDirichletFn::new(g0 as fn(Vec3) -> f32);
+        let source = ZeroSource;
+
+        let root = Cell::new(
+            Vec3::new(-0.5, -0.5, -0.5),
+            Vec3::new(0.5, 0.5, 0.5),
+            0,
+            0xBAD5EED,
+        );
+
+        // max_depth = 0 forces convergence after first sampling pass.
+        let params = IsoParams::new(
+            0.0,
+            0.01,
+            0,
+            WalkBudget::new(1e-3, 8),
+            PoissonParams::new(1),
+        );
+        let mesher = Mesher::new(params.iso_value);
+
+        type TD = crate::SdfDomain<fn(Vec3) -> f32>;
+        type TA = crate::ClosestNaive;
+        type TB = crate::BoundaryDirichletFn<fn(Vec3) -> f32>;
+        type TS = ZeroSource;
+        let mut sched: IsoScheduler<'_, TD, TA, TB, TS> =
+            IsoScheduler::new(params, root, &solver, &boundary, &source);
+
+        let delta = sched.step(&mesher).expect("root cell should exist");
+        assert!(
+            delta.indices.len() <= delta.vertices.len(),
+            "mesh delta should remain consistent"
+        );
+        assert!(
+            sched.next_cell().is_none(),
+            "converged cell at max depth should not be requeued"
         );
     }
 
