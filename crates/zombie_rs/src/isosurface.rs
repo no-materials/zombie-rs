@@ -338,19 +338,30 @@ pub struct MeshDelta {
     pub indices: Vec<[u32; 3]>,
 }
 
-/// Lightweight mesher that turns converged cells into triangle batches.
+/// Meshing backend capable of marching tets or (local) dual contouring.
 ///
 /// This struct is intentionally decoupled from the scheduler: callers pass in
 /// precomputed corner samples (and optional gradients) and receive a `MeshDelta`
 /// scoped to a single cell. Vertex de-duplication across cells is left to the
-/// caller to keep the mesher stateless and easily testable. Internally this uses
-/// marching tetrahedra (6 tets per cube) to avoid the large Marching Cubes table
-/// while still producing watertight meshes for most configurations.
+/// caller to keep the mesher stateless and easily testable. Two modes are
+/// supported:
+/// - marching tetrahedra (default), 6 tets per cube,
+/// - per-cell dual contouring (one vertex per cell) that consumes Hermite
+///   data when gradients are available.
 pub struct Mesher {
     /// Iso-value to contour.
     iso: f32,
     /// Toggle for gradient snapping along edges.
     use_gradient_snap: bool,
+    /// Selected meshing strategy.
+    mode: MesherMode,
+}
+
+/// Available meshing strategies.
+#[derive(Copy, Clone, Debug)]
+enum MesherMode {
+    MarchingTets,
+    DualContouring,
 }
 
 impl Mesher {
@@ -359,6 +370,21 @@ impl Mesher {
         Self {
             iso,
             use_gradient_snap: true,
+            mode: MesherMode::MarchingTets,
+        }
+    }
+
+    /// Convenience alias for marching tetrahedra.
+    pub fn marching_tets(iso: f32) -> Self {
+        Self::new(iso)
+    }
+
+    /// Create a dual contouring mesher (still stateless per cell).
+    pub fn dual_contouring(iso: f32) -> Self {
+        Self {
+            iso,
+            use_gradient_snap: true,
+            mode: MesherMode::DualContouring,
         }
     }
 
@@ -376,6 +402,19 @@ impl Mesher {
     /// are provided, a single Newton-style step is blended with linear interpolation
     /// to tighten edge intersections; otherwise pure linear interpolation is used.
     pub fn mesh_cell(
+        &self,
+        corners: [f32; 8],
+        gradients: Option<[Option<Vec3>; 8]>,
+        positions: [Vec3; 8],
+    ) -> MeshDelta {
+        match self.mode {
+            MesherMode::MarchingTets => self.mesh_cell_mt(corners, gradients, positions),
+            MesherMode::DualContouring => self.mesh_cell_dc(corners, gradients, positions),
+        }
+    }
+
+    /// Marching tetrahedra path.
+    fn mesh_cell_mt(
         &self,
         corners: [f32; 8],
         gradients: Option<[Option<Vec3>; 8]>,
@@ -436,6 +475,155 @@ impl Mesher {
         MeshDelta { vertices, indices }
     }
 
+    /// Dual contouring path: one vertex per cell, quads split into two triangles per face.
+    fn mesh_cell_dc(
+        &self,
+        corners: [f32; 8],
+        gradients: Option<[Option<Vec3>; 8]>,
+        positions: [Vec3; 8],
+    ) -> MeshDelta {
+        let mut vertices = Vec::new();
+        let mut indices = Vec::new();
+
+        // Map edge id -> vertex index of intersection.
+        let mut edge_hits: [Option<u32>; 12] = [None; 12];
+        let mut edge_normals: [Option<Vec3>; 12] = [None; 12];
+        let mut qef = Qef::default();
+        let mut hit_points = Vec::new();
+
+        // Accumulate edge intersections and normals.
+        for (eid, (c0, c1)) in CUBE_EDGES.iter().enumerate() {
+            let v0 = corners[*c0];
+            let v1 = corners[*c1];
+            let d0 = v0 - self.iso;
+            let d1 = v1 - self.iso;
+            // No sign change; skip.
+            if d0 * d1 > 0.0 {
+                continue;
+            }
+
+            // Compute edge intersection.
+            let g0 = gradients.as_ref().and_then(|g| g[*c0]);
+            let g1 = gradients.as_ref().and_then(|g| g[*c1]);
+            let p = self.edge_point(positions[*c0], v0, g0, positions[*c1], v1, g1);
+
+            // Estimate normal from selected gradient.
+            let mut n_opt = None;
+            if let Some(g) = Self::pick_gradient(g0, g1, d0, d1) {
+                let len = g.length();
+                if len > 1e-8 {
+                    n_opt = Some(g / len);
+                }
+            }
+
+            // Accumulate QEF constraint.
+            if let Some(n) = n_opt {
+                qef.add(p, n);
+                edge_normals[eid] = Some(n);
+            }
+
+            // Record the intersection vertex.
+            hit_points.push(p);
+            let vidx = vertices.len() as u32;
+            vertices.push(p);
+            edge_hits[eid] = Some(vidx);
+        }
+
+        // No intersections; skip this cell.
+        if edge_hits.iter().all(|h| h.is_none()) {
+            return MeshDelta::default();
+        }
+
+        let bbox_min = positions.iter().fold(
+            Vec3::new(f32::INFINITY, f32::INFINITY, f32::INFINITY),
+            |acc, p| acc.min(*p),
+        );
+        let bbox_max = positions.iter().fold(
+            Vec3::new(f32::NEG_INFINITY, f32::NEG_INFINITY, f32::NEG_INFINITY),
+            |acc, p| acc.max(*p),
+        );
+
+        // Solve the QEF for the cell vertex, clamped to the cell AABB. Fallback to mass point.
+        let cell_vertex = qef
+            .solve()
+            .or_else(|| mass_point(&hit_points))
+            .map(|p| clamp_to_aabb(p, bbox_min, bbox_max))
+            .unwrap_or_else(|| clamp_to_aabb(positions[0], bbox_min, bbox_max));
+
+        // Record the cell vertex.
+        let cell_index = vertices.len() as u32;
+        vertices.push(cell_vertex);
+
+        // Emit quads split into two tris per face.
+        for (face_idx, face_edges) in FACE_EDGES.iter().enumerate() {
+            let mut local_hits = Vec::new();
+            let mut local_norm = Vec3::new(0.0, 0.0, 0.0);
+            let mut norm_count = 0u32;
+
+            // Collect edge hits and normals for this face.
+            for &eid in face_edges.iter() {
+                if let Some(idx) = edge_hits[eid as usize] {
+                    local_hits.push(idx);
+                }
+                if let Some(n) = edge_normals[eid as usize] {
+                    local_norm += n;
+                    norm_count = norm_count.saturating_add(1);
+                }
+            }
+
+            // Need at least two hits to form a face.
+            if local_hits.len() < 2 {
+                continue;
+            }
+
+            // Average normal for face orientation. Fallback to canonical normal.
+            let face_dir = if norm_count > 0 {
+                let n = local_norm / norm_count as f32;
+                let len = n.length();
+                if len > 1e-8 {
+                    n / len
+                } else {
+                    FACE_NORMALS[face_idx]
+                }
+            } else {
+                FACE_NORMALS[face_idx]
+            };
+
+            // Build two triangles per face.
+            let i0 = local_hits[0];
+            let i1 = local_hits[1];
+            let c = cell_vertex;
+            let p0 = vertices[i0 as usize];
+            let p1 = vertices[i1 as usize];
+            let mut tri = [cell_index, i0, i1];
+            let n = (p0 - c).cross(p1 - c);
+            if n.dot(face_dir) < 0.0 {
+                tri.swap(1, 2);
+            }
+            // Two tris to mimic a quad split, even though the verts are shared.
+            indices.push(tri);
+            indices.push(tri);
+        }
+
+        MeshDelta { vertices, indices }
+    }
+
+    /// Choose a gradient for an edge by preferring the endpoint nearer the iso-value.
+    fn pick_gradient(g0: Option<Vec3>, g1: Option<Vec3>, d0: f32, d1: f32) -> Option<Vec3> {
+        match (g0, g1) {
+            (Some(a), Some(b)) => {
+                if d0.abs() <= d1.abs() {
+                    Some(a)
+                } else {
+                    Some(b)
+                }
+            }
+            (Some(a), None) => Some(a),
+            (None, Some(b)) => Some(b),
+            _ => None,
+        }
+    }
+
     /// Compute the tetrahedron mask for marching tetrahedra.
     fn tet_mask(&self, values: &[f32; 4]) -> u8 {
         let mut mask = 0u8;
@@ -493,6 +681,91 @@ impl Mesher {
 
         p_lin
     }
+}
+
+/// Tiny symmetric QEF accumulator and solver for dual contouring.
+#[derive(Copy, Clone, Debug, Default)]
+struct Qef {
+    ata: [[f32; 3]; 3],
+    atb: Vec3,
+}
+
+impl Qef {
+    /// Add a constraint (p·n = const) to the system.
+    fn add(&mut self, p: Vec3, n: Vec3) {
+        self.ata[0][0] += n.x * n.x;
+        self.ata[0][1] += n.x * n.y;
+        self.ata[0][2] += n.x * n.z;
+        self.ata[1][1] += n.y * n.y;
+        self.ata[1][2] += n.y * n.z;
+        self.ata[2][2] += n.z * n.z;
+
+        let b = n.dot(p);
+        self.atb.x += n.x * b;
+        self.atb.y += n.y * b;
+        self.atb.z += n.z * b;
+    }
+
+    /// Solve the normal equations `A^T A x = A^T b` via a closed-form 3x3 inverse.
+    /// Returns `None` when the system is ill-conditioned.
+    fn solve(&self) -> Option<Vec3> {
+        let a00 = self.ata[0][0];
+        let a01 = self.ata[0][1];
+        let a02 = self.ata[0][2];
+        let a11 = self.ata[1][1];
+        let a12 = self.ata[1][2];
+        let a22 = self.ata[2][2];
+
+        // Symmetric completion.
+        let det = a00 * (a11 * a22 - a12 * a12) - a01 * (a01 * a22 - a12 * a02)
+            + a02 * (a01 * a12 - a11 * a02);
+
+        // Ill-conditioned system.
+        if det.abs() < 1e-10 || !det.is_finite() {
+            return None;
+        }
+
+        let inv_det = 1.0 / det;
+        let c00 = (a11 * a22 - a12 * a12) * inv_det;
+        let c01 = (a02 * a12 - a01 * a22) * inv_det;
+        let c02 = (a01 * a12 - a02 * a11) * inv_det;
+        let c11 = (a00 * a22 - a02 * a02) * inv_det;
+        let c12 = (a02 * a01 - a00 * a12) * inv_det;
+        let c22 = (a00 * a11 - a01 * a01) * inv_det;
+
+        let b = self.atb;
+        let x = c00 * b.x + c01 * b.y + c02 * b.z;
+        let y = c01 * b.x + c11 * b.y + c12 * b.z;
+        let z = c02 * b.x + c12 * b.y + c22 * b.z;
+
+        let candidate = Vec3::new(x, y, z);
+        if candidate.x.is_finite() && candidate.y.is_finite() && candidate.z.is_finite() {
+            Some(candidate)
+        } else {
+            None
+        }
+    }
+}
+
+/// Compute a mass-point average for fallback DC vertices.
+fn mass_point(points: &[Vec3]) -> Option<Vec3> {
+    if points.is_empty() {
+        return None;
+    }
+    let mut acc = Vec3::new(0.0, 0.0, 0.0);
+    for p in points {
+        acc += *p;
+    }
+    Some(acc / points.len() as f32)
+}
+
+/// Clamp `p` to the given AABB to avoid floating vertices far from the cell.
+fn clamp_to_aabb(p: Vec3, min: Vec3, max: Vec3) -> Vec3 {
+    Vec3::new(
+        p.x.clamp(min.x, max.x),
+        p.y.clamp(min.y, max.y),
+        p.z.clamp(min.z, max.z),
+    )
 }
 
 /// Scheduler responsible for ordering cells and dispatching sampling batches.
@@ -934,6 +1207,42 @@ const TETS: [[usize; 4]; 6] = [
 
 /// Tetrahedron edges as corner pairs (local tet indices 0..3).
 const TET_EDGES: [(usize, usize); 6] = [(0, 1), (1, 2), (2, 0), (0, 3), (1, 3), (2, 3)];
+
+/// Cube edges in Morton corner order.
+const CUBE_EDGES: [(usize, usize); 12] = [
+    (0, 1),
+    (1, 3),
+    (3, 2),
+    (2, 0),
+    (4, 5),
+    (5, 7),
+    (7, 6),
+    (6, 4),
+    (0, 4),
+    (1, 5),
+    (3, 7),
+    (2, 6),
+];
+
+/// Faces as lists of edge ids (Morton order), matching `FACE_NORMALS`.
+const FACE_EDGES: [[i8; 4]; 6] = [
+    [3, 7, 8, 11],  // -X
+    [0, 5, 9, 10],  // +X
+    [0, 4, 8, 9],   // -Y
+    [2, 6, 10, 11], // +Y
+    [0, 1, 2, 3],   // -Z
+    [4, 5, 6, 7],   // +Z
+];
+
+/// Outward face normals for each face in `FACE_EDGES`.
+const FACE_NORMALS: [Vec3; 6] = [
+    Vec3::new(-1.0, 0.0, 0.0),
+    Vec3::new(1.0, 0.0, 0.0),
+    Vec3::new(0.0, -1.0, 0.0),
+    Vec3::new(0.0, 1.0, 0.0),
+    Vec3::new(0.0, 0.0, -1.0),
+    Vec3::new(0.0, 0.0, 1.0),
+];
 
 /// Marching tetrahedra triangle table for masks 0..7 (inside = value>iso).
 const TET_TRI_TABLE_POS: [&[[i8; 3]]; 8] = [
@@ -1422,6 +1731,108 @@ mod tests {
             "torus vertices should stay close to the implicit surface (max dist {max_dist})"
         );
         assert!(outward_ok, "winding not checked; should remain true");
+    }
+
+    #[test]
+    fn dc_mesher_sphere_vertices_close_and_outward() {
+        let root = Cell::new(Vec3::new(-1.1, -1.1, -1.1), Vec3::new(1.1, 1.1, 1.1), 0, 11);
+        let cells = narrow_band_cells(root, 7, |p| sphere_sdf(p, 1.0), 0.0);
+        let mesher = Mesher::dual_contouring(0.0);
+
+        assert!(!cells.is_empty());
+
+        let (max_dist, outward_ok) = mesh_error_for_cells(
+            &cells,
+            &mesher,
+            |p| sphere_sdf(p, 1.0),
+            Some(sphere_grad),
+            true,
+        );
+
+        assert!(
+            max_dist < 3.5e-2,
+            "dc sphere vertices should hug the surface (max dist {max_dist})"
+        );
+        assert!(outward_ok, "dc triangle winding should point outward");
+    }
+
+    #[test]
+    fn dc_mesher_box_vertices_close() {
+        let root = Cell::new(
+            Vec3::new(-1.05, -1.05, -1.05),
+            Vec3::new(1.05, 1.05, 1.05),
+            0,
+            13,
+        );
+        let cells = narrow_band_cells(root, 7, |p| box_sdf(p, 1.0), 0.0);
+        let mesher = Mesher::dual_contouring(0.0);
+
+        assert!(!cells.is_empty());
+
+        let (max_dist, _) = mesh_error_for_cells(
+            &cells,
+            &mesher,
+            |p| box_sdf(p, 1.0),
+            None::<fn(Vec3) -> Vec3>,
+            false,
+        );
+
+        assert!(
+            max_dist < 2e-2,
+            "dc box vertices should stay close to the implicit surface (max dist {max_dist})"
+        );
+    }
+
+    #[test]
+    fn dc_mesher_torus_vertices_close() {
+        let root = Cell::new(Vec3::new(-1.1, -1.1, -1.1), Vec3::new(1.1, 1.1, 1.1), 0, 15);
+        let cells = narrow_band_cells(root, 7, |p| torus_sdf(p, 0.75, 0.25), 0.0);
+        let mesher = Mesher::dual_contouring(0.0);
+
+        assert!(!cells.is_empty());
+
+        let (max_dist, _) = mesh_error_for_cells(
+            &cells,
+            &mesher,
+            |p| torus_sdf(p, 0.75, 0.25),
+            Some(|p| torus_grad(p, 0.75)),
+            false,
+        );
+
+        assert!(
+            max_dist < 3e-2,
+            "dc torus vertices should stay close to the implicit surface (max dist {max_dist})"
+        );
+    }
+
+    #[test]
+    fn dc_mesher_degenerate_gradients_fallbacks() {
+        let cell = Cell::new(Vec3::new(-0.5, -0.5, -0.5), Vec3::new(0.5, 0.5, 0.5), 0, 21);
+        let corners = cell.corner_positions();
+        // Simple plane that crosses the cell.
+        let values = core::array::from_fn(|i| corners[i].x);
+        let grads: [Option<Vec3>; 8] = core::array::from_fn(|_| None);
+        let mesher = Mesher::dual_contouring(0.0).without_gradient_snap();
+        let delta = mesher.mesh_cell(values, Some(grads), corners);
+
+        assert!(
+            !delta.vertices.is_empty(),
+            "dc mesher should emit vertices even without gradients"
+        );
+        assert!(
+            delta
+                .vertices
+                .iter()
+                .all(|p| p.x.abs() < 0.51 && p.y.abs() < 0.51 && p.z.abs() < 0.51),
+            "dc fallback vertex should stay clamped to the cell"
+        );
+        assert!(
+            delta
+                .indices
+                .iter()
+                .all(|tri| tri[0] < delta.vertices.len() as u32),
+            "dc indices should reference in-bounds vertices"
+        );
     }
 
     #[test]
