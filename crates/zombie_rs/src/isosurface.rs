@@ -4,7 +4,10 @@
 //! Cells are refined based on variance or detected sign-changes of the sampled
 //! field, using Monte Carlo estimators from the existing `Solver` API. A small
 //! mesher is provided that consumes converged cells, but meshing is kept
-//! decoupled from scheduling so sampling can be driven independently.
+//! decoupled from scheduling so sampling can be driven independently. Both
+//! marching tetrahedra and a cell-local dual contouring variant are available,
+//! and schedulers can emit per-cell or batched `MeshDelta` instances for
+//! downstream stitching.
 
 extern crate alloc;
 
@@ -329,12 +332,15 @@ impl IsoParams {
     }
 }
 
-/// Incremental mesh delta emitted per-cell by the mesher/scheduler.
+/// Incremental mesh delta emitted by the mesher or scheduler.
+///
+/// A delta may represent one cell (single-step) or many cells (batched step);
+/// callers can append the returned data directly to an accumulated mesh.
 #[derive(Clone, Debug, Default)]
 pub struct MeshDelta {
-    /// Vertex positions emitted by a scheduler iteration.
+    /// Vertex positions emitted by a scheduler iteration or batch.
     pub vertices: Vec<Vec3>,
-    /// Triangle indices emitted by a scheduler iteration.
+    /// Triangle indices emitted by a scheduler iteration or batch.
     pub indices: Vec<[u32; 3]>,
 }
 
@@ -345,9 +351,11 @@ pub struct MeshDelta {
 /// scoped to a single cell. Vertex de-duplication across cells is left to the
 /// caller to keep the mesher stateless and easily testable. Two modes are
 /// supported:
-/// - marching tetrahedra (default), 6 tets per cube,
+/// - marching tetrahedra (default), 6 tets per cube;
 /// - per-cell dual contouring (one vertex per cell) that consumes Hermite
-///   data when gradients are available.
+///   data when gradients are available. The DC path is cell-local only: faces
+///   use the first two edge hits to emit a split quad and do not weld across
+///   neighbouring cells.
 pub struct Mesher {
     /// Iso-value to contour.
     iso: f32,
@@ -396,7 +404,7 @@ impl Mesher {
         }
     }
 
-    /// Generate a mesh for a single cell using marching tetrahedra.
+    /// Generate a mesh for a single cell using the configured mode.
     ///
     /// The `corners` array is expected in Morton order (000..111). When gradients
     /// are provided, a single Newton-style step is blended with linear interpolation
@@ -475,7 +483,11 @@ impl Mesher {
         MeshDelta { vertices, indices }
     }
 
-    /// Dual contouring path: one vertex per cell, quads split into two triangles per face.
+    /// Dual contouring path: one vertex per cell, faces split using local edge hits.
+    ///
+    /// This variant is intentionally cell-local: the first two intersected edges per
+    /// face are used to emit two triangles that share the same three vertices,
+    /// avoiding neighbour lookups or welding.
     fn mesh_cell_dc(
         &self,
         corners: [f32; 8],
@@ -861,7 +873,8 @@ where
     ///
     /// This is useful for stitching per-frame batches without imposing a global vertex
     /// deduplication policy. Indices are offset internally so callers can append the
-    /// returned `MeshDelta` directly to their accumulated mesh.
+    /// returned `MeshDelta` directly to their accumulated mesh. Returns `None` when
+    /// no cells were processed (e.g., the queue was empty).
     pub fn step_batch(&mut self, mesher: &Mesher, max_cells: Option<usize>) -> Option<MeshDelta> {
         let mut processed = 0usize;
         let mut accum = MeshDelta::default();
