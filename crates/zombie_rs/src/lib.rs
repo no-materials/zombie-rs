@@ -13,6 +13,7 @@ pub mod accel;
 pub mod boundary;
 pub mod domain;
 pub mod estimators;
+pub mod isosurface;
 pub mod math;
 pub mod observer;
 pub mod params;
@@ -30,6 +31,7 @@ pub use estimators::{
     grad_laplace_dirichlet_wos, grad_poisson_dirichlet_wos, wos_laplace_dirichlet,
     wos_poisson_dirichlet, wos_screened_poisson_dirichlet,
 };
+pub use isosurface::{Cell, IsoParams, IsoScheduler, MeshDelta};
 pub use math::{Aabb, Vec3, closest_point_on_triangle};
 pub use observer::{
     NoopObserver, PlyRecorder, StatsObserver, TerminationReason, WalkObserver, WalkOutcome,

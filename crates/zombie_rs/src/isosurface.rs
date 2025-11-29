@@ -1,0 +1,1939 @@
+//! Progressive isosurface scaffolding.
+//!
+//! This module implements the sampling core for progressive isosurface extraction.
+//! Cells are refined based on variance or detected sign-changes of the sampled
+//! field, using Monte Carlo estimators from the existing `Solver` API. A small
+//! mesher is provided that consumes converged cells, but meshing is kept
+//! decoupled from scheduling so sampling can be driven independently. Both
+//! marching tetrahedra and a cell-local dual contouring variant are available,
+//! and schedulers can emit per-cell or batched `MeshDelta` instances for
+//! downstream stitching.
+
+extern crate alloc;
+
+use alloc::boxed::Box;
+use alloc::collections::BinaryHeap;
+use alloc::vec::Vec;
+use core::cmp::Ordering;
+use core::marker::PhantomData;
+
+use crate::math::{Aabb, Vec3};
+use crate::params::{GradParams, PoissonParams, WalkBudget};
+use crate::rng::Rng;
+use crate::solver::Solver;
+use crate::stats::Stats;
+use crate::{BoundaryDirichlet, ClosestAccel, Domain, SourceTerm};
+
+/// Per-cell statistics and bounds for progressive sampling.
+#[derive(Clone, Debug)]
+pub struct Cell {
+    /// Minimum corner of the axis-aligned bounds.
+    bbox_min: Vec3,
+    /// Maximum corner of the axis-aligned bounds.
+    bbox_max: Vec3,
+    /// Per-corner streaming statistics of the sampled field.
+    samples: [Stats; 8],
+    /// Streaming statistics for the cell center (used when enabled).
+    center: Stats,
+    /// Optional running mean gradients per corner.
+    corner_grad: [Option<Vec3>; 8],
+    /// Optional running mean gradient at the cell center.
+    center_grad: Option<Vec3>,
+    /// Deterministic RNG bound to this cell for reproducible sampling.
+    rng: Rng,
+    /// Cached variance proxy for queue priority.
+    variance: f32,
+    /// Octree depth (root = 0).
+    depth: u8,
+    /// Child cells in Morton order; `None` when not yet subdivided.
+    children: [Option<Box<Cell>>; 8],
+    /// Logical timestamp used by schedulers to track recency.
+    last_touched: u64,
+}
+
+impl Cell {
+    /// Create a new leaf cell covering `bbox_min..bbox_max` at `depth` with a deterministic seed.
+    pub fn new(bbox_min: Vec3, bbox_max: Vec3, depth: u8, seed: u64) -> Self {
+        Self {
+            bbox_min,
+            bbox_max,
+            samples: core::array::from_fn(|_| Stats::default()),
+            center: Stats::default(),
+            corner_grad: core::array::from_fn(|_| None),
+            center_grad: None,
+            rng: Rng::seed_from(seed),
+            variance: 0.0,
+            depth,
+            children: core::array::from_fn(|_| None),
+            last_touched: 0,
+        }
+    }
+
+    /// Axis-aligned bounding box of the cell.
+    pub fn bbox(&self) -> Aabb {
+        Aabb {
+            min: self.bbox_min,
+            max: self.bbox_max,
+        }
+    }
+
+    /// Center of the cell.
+    pub fn center(&self) -> Vec3 {
+        (self.bbox_min + self.bbox_max) * 0.5
+    }
+
+    /// Minimum corner of the bounds.
+    pub fn bbox_min(&self) -> Vec3 {
+        self.bbox_min
+    }
+
+    /// Maximum corner of the bounds.
+    pub fn bbox_max(&self) -> Vec3 {
+        self.bbox_max
+    }
+
+    /// Corner positions in Morton order (000..111).
+    pub fn corner_positions(&self) -> [Vec3; 8] {
+        let min = self.bbox_min;
+        let max = self.bbox_max;
+        [
+            Vec3::new(min.x, min.y, min.z),
+            Vec3::new(max.x, min.y, min.z),
+            Vec3::new(min.x, max.y, min.z),
+            Vec3::new(max.x, max.y, min.z),
+            Vec3::new(min.x, min.y, max.z),
+            Vec3::new(max.x, min.y, max.z),
+            Vec3::new(min.x, max.y, max.z),
+            Vec3::new(max.x, max.y, max.z),
+        ]
+    }
+
+    /// Update the cached variance using both corner and center statistics.
+    pub fn refresh_variance(&mut self) {
+        self.variance = self
+            .samples
+            .iter()
+            .fold(self.center.var(), |acc, s| acc.max(s.var()));
+    }
+
+    /// Return `true` when the cell has been sampled at least once.
+    fn has_samples(&self, include_center: bool) -> bool {
+        let mut seen = self.samples.iter().any(|s| s.count() > 0);
+        if include_center {
+            seen |= self.center.count() > 0;
+        }
+        seen
+    }
+
+    /// Return `true` when sampling has converged or the cell cannot be subdivided.
+    ///
+    /// Convergence requires at least one sample; a cell at `max_depth` is also
+    /// treated as converged even if its variance is still above tolerance because
+    /// no further refinement is possible.
+    pub fn is_converged(&self, params: &IsoParams) -> bool {
+        if !self.has_samples(params.sample_center) {
+            return false;
+        }
+        self.variance() <= params.variance_tol || !self.can_subdivide(params.max_depth)
+    }
+
+    /// Return `true` when the cell can be split.
+    pub fn can_subdivide(&self, max_depth: u8) -> bool {
+        self.depth < max_depth
+    }
+
+    /// Split the cell into eight children seeded with `seeds`; each child starts empty.
+    pub fn subdivide_with_seeds(&self, seeds: [u64; 8]) -> [Cell; 8] {
+        let mid = self.center();
+        let min = self.bbox_min;
+        let max = self.bbox_max;
+        core::array::from_fn(|i| {
+            let child_min = Vec3::new(
+                if i & 1 == 0 { min.x } else { mid.x },
+                if i & 2 == 0 { min.y } else { mid.y },
+                if i & 4 == 0 { min.z } else { mid.z },
+            );
+            let child_max = Vec3::new(
+                if i & 1 == 0 { mid.x } else { max.x },
+                if i & 2 == 0 { mid.y } else { max.y },
+                if i & 4 == 0 { mid.z } else { max.z },
+            );
+            Cell::new(child_min, child_max, self.depth.saturating_add(1), seeds[i])
+        })
+    }
+
+    /// Read the cached variance used for prioritisation.
+    pub fn variance(&self) -> f32 {
+        self.variance
+    }
+
+    /// Override the cached variance (used internally by schedulers).
+    #[cfg_attr(not(test), allow(dead_code))]
+    pub(crate) fn set_variance(&mut self, variance: f32) {
+        self.variance = variance;
+    }
+
+    /// Depth of this cell in the octree (root = 0).
+    pub fn depth(&self) -> u8 {
+        self.depth
+    }
+
+    /// Update the depth (used internally; tests craft tie-break scenarios).
+    #[cfg_attr(not(test), allow(dead_code))]
+    pub(crate) fn set_depth(&mut self, depth: u8) {
+        self.depth = depth;
+    }
+
+    /// Last-touched logical timestamp.
+    pub fn last_touched(&self) -> u64 {
+        self.last_touched
+    }
+
+    /// Update the last-touched timestamp.
+    #[allow(dead_code)]
+    pub(crate) fn set_last_touched(&mut self, stamp: u64) {
+        self.last_touched = stamp;
+    }
+
+    /// Immutable view of the corner statistics.
+    pub(crate) fn samples(&self) -> &[Stats; 8] {
+        &self.samples
+    }
+
+    /// Copy out corner means for meshing or diagnostics.
+    pub(crate) fn corner_means(&self) -> [f32; 8] {
+        core::array::from_fn(|i| self.samples[i].mean())
+    }
+
+    /// Mutable view of the corner statistics.
+    pub(crate) fn samples_mut(&mut self) -> &mut [Stats; 8] {
+        &mut self.samples
+    }
+
+    /// Immutable view of child handles.
+    #[allow(dead_code)]
+    pub(crate) fn children(&self) -> &[Option<Box<Cell>>; 8] {
+        &self.children
+    }
+
+    /// Mutable view of child handles.
+    pub(crate) fn children_mut(&mut self) -> &mut [Option<Box<Cell>>; 8] {
+        &mut self.children
+    }
+
+    /// Immutable view of the center statistics.
+    pub fn center_stats(&self) -> &Stats {
+        &self.center
+    }
+
+    /// Mutable view of the center statistics.
+    pub(crate) fn center_stats_mut(&mut self) -> &mut Stats {
+        &mut self.center
+    }
+
+    /// Mutable access to the cell RNG for sampling.
+    fn rng_mut(&mut self) -> &mut Rng {
+        &mut self.rng
+    }
+
+    /// Re-seed the cell RNG deterministically.
+    pub(crate) fn reset_rng(&mut self, seed: u64) {
+        self.rng = Rng::seed_from(seed);
+    }
+
+    /// Mutable view of corner gradients.
+    pub(crate) fn corner_grads_mut(&mut self) -> &mut [Option<Vec3>; 8] {
+        &mut self.corner_grad
+    }
+
+    /// Copy out corner gradients (if any have been accumulated).
+    pub(crate) fn corner_grads(&self) -> [Option<Vec3>; 8] {
+        self.corner_grad
+    }
+
+    /// Mutable view of the center gradient.
+    pub(crate) fn center_grad_mut(&mut self) -> &mut Option<Vec3> {
+        &mut self.center_grad
+    }
+}
+
+/// User-facing knobs for progressive sampling.
+#[derive(Copy, Clone, Debug)]
+pub struct IsoParams {
+    /// Target iso-value to track.
+    pub iso_value: f32,
+    /// Variance threshold used to decide refinement.
+    pub variance_tol: f32,
+    /// Maximum octree depth.
+    pub max_depth: u8,
+    /// Number of samples to take when a cell is processed.
+    pub batch_samples: u32,
+    /// Walk configuration forwarded to WoS estimators.
+    pub walk: WalkBudget,
+    /// Poisson parameters forwarded to estimators.
+    pub poisson: PoissonParams,
+    /// Optional gradient sampling configuration.
+    pub grad: Option<GradParams>,
+    /// Whether to sample the cell center in addition to corners.
+    pub sample_center: bool,
+    /// Global base seed used to derive per-cell RNG seeds.
+    pub base_seed: u64,
+}
+
+impl IsoParams {
+    /// Construct a parameter set with explicit variance tolerance and depth.
+    pub fn new(
+        iso_value: f32,
+        variance_tol: f32,
+        max_depth: u8,
+        walk: WalkBudget,
+        poisson: PoissonParams,
+    ) -> Self {
+        Self {
+            iso_value,
+            variance_tol,
+            max_depth,
+            batch_samples: 1,
+            walk,
+            poisson,
+            grad: None,
+            sample_center: true,
+            base_seed: 0xA5A5_A5A5_1234_5678,
+        }
+    }
+
+    /// Override the per-cell batch size.
+    pub fn with_batch_samples(self, batch_samples: u32) -> Self {
+        Self {
+            batch_samples: batch_samples.max(1),
+            ..self
+        }
+    }
+
+    /// Enable gradient sampling.
+    pub fn with_grad(self, grad: GradParams) -> Self {
+        Self {
+            grad: Some(grad),
+            ..self
+        }
+    }
+
+    /// Disable center sampling (corners only).
+    pub fn without_center_sampling(self) -> Self {
+        Self {
+            sample_center: false,
+            ..self
+        }
+    }
+
+    /// Override the global base seed.
+    pub fn with_base_seed(self, base_seed: u64) -> Self {
+        Self { base_seed, ..self }
+    }
+}
+
+/// Incremental mesh delta emitted by the mesher or scheduler.
+///
+/// A delta may represent one cell (single-step) or many cells (batched step);
+/// callers can append the returned data directly to an accumulated mesh.
+#[derive(Clone, Debug, Default)]
+pub struct MeshDelta {
+    /// Vertex positions emitted by a scheduler iteration or batch.
+    pub vertices: Vec<Vec3>,
+    /// Triangle indices emitted by a scheduler iteration or batch.
+    pub indices: Vec<[u32; 3]>,
+}
+
+/// Meshing backend capable of marching tets or (local) dual contouring.
+///
+/// This struct is intentionally decoupled from the scheduler: callers pass in
+/// precomputed corner samples (and optional gradients) and receive a `MeshDelta`
+/// scoped to a single cell. Vertex de-duplication across cells is left to the
+/// caller to keep the mesher stateless and easily testable. Two modes are
+/// supported:
+/// - marching tetrahedra (default), 6 tets per cube;
+/// - per-cell dual contouring (one vertex per cell) that consumes Hermite
+///   data when gradients are available. The DC path is cell-local only: faces
+///   use the first two edge hits to emit a split quad and do not weld across
+///   neighbouring cells.
+pub struct Mesher {
+    /// Iso-value to contour.
+    iso: f32,
+    /// Toggle for gradient snapping along edges.
+    use_gradient_snap: bool,
+    /// Selected meshing strategy.
+    mode: MesherMode,
+}
+
+/// Available meshing strategies.
+#[derive(Copy, Clone, Debug)]
+enum MesherMode {
+    MarchingTets,
+    DualContouring,
+}
+
+impl Mesher {
+    /// Create a mesher that extracts the iso-surface `iso`. Gradient snap is enabled by default.
+    pub fn new(iso: f32) -> Self {
+        Self {
+            iso,
+            use_gradient_snap: true,
+            mode: MesherMode::MarchingTets,
+        }
+    }
+
+    /// Convenience alias for marching tetrahedra.
+    pub fn marching_tets(iso: f32) -> Self {
+        Self::new(iso)
+    }
+
+    /// Create a dual contouring mesher (still stateless per cell).
+    pub fn dual_contouring(iso: f32) -> Self {
+        Self {
+            iso,
+            use_gradient_snap: true,
+            mode: MesherMode::DualContouring,
+        }
+    }
+
+    /// Disable gradient-based snapping of edge intersections.
+    pub fn without_gradient_snap(self) -> Self {
+        Self {
+            use_gradient_snap: false,
+            ..self
+        }
+    }
+
+    /// Generate a mesh for a single cell using the configured mode.
+    ///
+    /// The `corners` array is expected in Morton order (000..111). When gradients
+    /// are provided, a single Newton-style step is blended with linear interpolation
+    /// to tighten edge intersections; otherwise pure linear interpolation is used.
+    pub fn mesh_cell(
+        &self,
+        corners: [f32; 8],
+        gradients: Option<[Option<Vec3>; 8]>,
+        positions: [Vec3; 8],
+    ) -> MeshDelta {
+        match self.mode {
+            MesherMode::MarchingTets => self.mesh_cell_mt(corners, gradients, positions),
+            MesherMode::DualContouring => self.mesh_cell_dc(corners, gradients, positions),
+        }
+    }
+
+    /// Marching tetrahedra path.
+    fn mesh_cell_mt(
+        &self,
+        corners: [f32; 8],
+        gradients: Option<[Option<Vec3>; 8]>,
+        positions: [Vec3; 8],
+    ) -> MeshDelta {
+        let mut vertices = Vec::new();
+        let mut indices = Vec::new();
+
+        for tet in TETS {
+            // Build local values/positions for this tet.
+            let mut tv = [0f32; 4];
+            let mut tp = [Vec3::new(0.0, 0.0, 0.0); 4];
+            let mut tg: [Option<Vec3>; 4] = [None, None, None, None];
+            for (i, &cidx) in tet.iter().enumerate() {
+                tv[i] = corners[cidx];
+                tp[i] = positions[cidx];
+                if let Some(allg) = gradients.as_ref() {
+                    tg[i] = allg[cidx];
+                }
+            }
+
+            // Cheap centroid gradient estimate to orient triangles when gradients are present.
+            let g_centroid = tg
+                .iter()
+                .flatten()
+                .fold((Vec3::new(0.0, 0.0, 0.0), 0u32), |(acc, n), g| {
+                    (acc + *g, n.saturating_add(1))
+                });
+            let g_centroid = if g_centroid.1 > 0 {
+                Some(g_centroid.0 / g_centroid.1 as f32)
+            } else {
+                None
+            };
+
+            let mask = self.tet_mask(&tv);
+            for tri in Self::tet_tris(mask) {
+                let mut tri_pts = [Vec3::default(); 3];
+                for (k, &edge_id) in tri.iter().enumerate() {
+                    let (c0, c1) = TET_EDGES[edge_id as usize];
+                    let p = self.edge_point(tp[c0], tv[c0], tg[c0], tp[c1], tv[c1], tg[c1]);
+                    tri_pts[k] = p;
+                }
+
+                // Orient the triangle outward if a centroid gradient is available.
+                if let Some(g) = g_centroid {
+                    let n = (tri_pts[1] - tri_pts[0]).cross(tri_pts[2] - tri_pts[0]);
+                    if n.dot(g) < 0.0 {
+                        tri_pts.swap(1, 2);
+                    }
+                }
+
+                let base = vertices.len() as u32;
+                vertices.extend_from_slice(&tri_pts);
+                indices.push([base, base + 1, base + 2]);
+            }
+        }
+
+        MeshDelta { vertices, indices }
+    }
+
+    /// Dual contouring path: one vertex per cell, faces split using local edge hits.
+    ///
+    /// This variant is intentionally cell-local: the first two intersected edges per
+    /// face are used to emit two triangles that share the same three vertices,
+    /// avoiding neighbour lookups or welding.
+    fn mesh_cell_dc(
+        &self,
+        corners: [f32; 8],
+        gradients: Option<[Option<Vec3>; 8]>,
+        positions: [Vec3; 8],
+    ) -> MeshDelta {
+        let mut vertices = Vec::new();
+        let mut indices = Vec::new();
+
+        // Map edge id -> vertex index of intersection.
+        let mut edge_hits: [Option<u32>; 12] = [None; 12];
+        let mut edge_normals: [Option<Vec3>; 12] = [None; 12];
+        let mut qef = Qef::default();
+        let mut hit_points = Vec::new();
+
+        // Accumulate edge intersections and normals.
+        for (eid, (c0, c1)) in CUBE_EDGES.iter().enumerate() {
+            let v0 = corners[*c0];
+            let v1 = corners[*c1];
+            let d0 = v0 - self.iso;
+            let d1 = v1 - self.iso;
+            // No sign change; skip.
+            if d0 * d1 > 0.0 {
+                continue;
+            }
+
+            // Compute edge intersection.
+            let g0 = gradients.as_ref().and_then(|g| g[*c0]);
+            let g1 = gradients.as_ref().and_then(|g| g[*c1]);
+            let p = self.edge_point(positions[*c0], v0, g0, positions[*c1], v1, g1);
+
+            // Estimate normal from selected gradient.
+            let mut n_opt = None;
+            if let Some(g) = Self::pick_gradient(g0, g1, d0, d1) {
+                let len = g.length();
+                if len > 1e-8 {
+                    n_opt = Some(g / len);
+                }
+            }
+
+            // Accumulate QEF constraint.
+            if let Some(n) = n_opt {
+                qef.add(p, n);
+                edge_normals[eid] = Some(n);
+            }
+
+            // Record the intersection vertex.
+            hit_points.push(p);
+            let vidx = vertices.len() as u32;
+            vertices.push(p);
+            edge_hits[eid] = Some(vidx);
+        }
+
+        // No intersections; skip this cell.
+        if edge_hits.iter().all(|h| h.is_none()) {
+            return MeshDelta::default();
+        }
+
+        let bbox_min = positions.iter().fold(
+            Vec3::new(f32::INFINITY, f32::INFINITY, f32::INFINITY),
+            |acc, p| acc.min(*p),
+        );
+        let bbox_max = positions.iter().fold(
+            Vec3::new(f32::NEG_INFINITY, f32::NEG_INFINITY, f32::NEG_INFINITY),
+            |acc, p| acc.max(*p),
+        );
+
+        // Solve the QEF for the cell vertex, clamped to the cell AABB. Fallback to mass point.
+        let cell_vertex = qef
+            .solve()
+            .or_else(|| mass_point(&hit_points))
+            .map(|p| clamp_to_aabb(p, bbox_min, bbox_max))
+            .unwrap_or_else(|| clamp_to_aabb(positions[0], bbox_min, bbox_max));
+
+        // Record the cell vertex.
+        let cell_index = vertices.len() as u32;
+        vertices.push(cell_vertex);
+
+        // Emit quads split into two tris per face.
+        for (face_idx, face_edges) in FACE_EDGES.iter().enumerate() {
+            let mut local_hits = Vec::new();
+            let mut local_norm = Vec3::new(0.0, 0.0, 0.0);
+            let mut norm_count = 0u32;
+
+            // Collect edge hits and normals for this face.
+            for &eid in face_edges.iter() {
+                if let Some(idx) = edge_hits[eid as usize] {
+                    local_hits.push(idx);
+                }
+                if let Some(n) = edge_normals[eid as usize] {
+                    local_norm += n;
+                    norm_count = norm_count.saturating_add(1);
+                }
+            }
+
+            // Need at least two hits to form a face.
+            if local_hits.len() < 2 {
+                continue;
+            }
+
+            // Average normal for face orientation. Fallback to canonical normal.
+            let face_dir = if norm_count > 0 {
+                let n = local_norm / norm_count as f32;
+                let len = n.length();
+                if len > 1e-8 {
+                    n / len
+                } else {
+                    FACE_NORMALS[face_idx]
+                }
+            } else {
+                FACE_NORMALS[face_idx]
+            };
+
+            // Build two triangles per face.
+            let i0 = local_hits[0];
+            let i1 = local_hits[1];
+            let c = cell_vertex;
+            let p0 = vertices[i0 as usize];
+            let p1 = vertices[i1 as usize];
+            let mut tri = [cell_index, i0, i1];
+            let n = (p0 - c).cross(p1 - c);
+            if n.dot(face_dir) < 0.0 {
+                tri.swap(1, 2);
+            }
+            // Two tris to mimic a quad split, even though the verts are shared.
+            indices.push(tri);
+            indices.push(tri);
+        }
+
+        MeshDelta { vertices, indices }
+    }
+
+    /// Choose a gradient for an edge by preferring the endpoint nearer the iso-value.
+    fn pick_gradient(g0: Option<Vec3>, g1: Option<Vec3>, d0: f32, d1: f32) -> Option<Vec3> {
+        match (g0, g1) {
+            (Some(a), Some(b)) => {
+                if d0.abs() <= d1.abs() {
+                    Some(a)
+                } else {
+                    Some(b)
+                }
+            }
+            (Some(a), None) => Some(a),
+            (None, Some(b)) => Some(b),
+            _ => None,
+        }
+    }
+
+    /// Compute the tetrahedron mask for marching tetrahedra.
+    fn tet_mask(&self, values: &[f32; 4]) -> u8 {
+        let mut mask = 0u8;
+        for (i, &v) in values.iter().enumerate() {
+            if v > self.iso {
+                mask |= 1 << i;
+            }
+        }
+        mask
+    }
+
+    /// Return triangle edge ids for a given tetrahedron mask (0..15), using symmetry to cover all cases.
+    fn tet_tris(mask: u8) -> &'static [[i8; 3]] {
+        let idx = (mask & 0x0F) as usize;
+        // Cases above 7 mirror the inside/outside assignment; reuse complements.
+        if idx <= 7 {
+            &TET_TRI_TABLE_POS[idx]
+        } else {
+            &TET_TRI_TABLE_NEG[15 - idx]
+        }
+    }
+
+    /// Interpolate an edge intersection, optionally blending a gradient snap.
+    fn edge_point(
+        &self,
+        p0: Vec3,
+        v0: f32,
+        g0: Option<Vec3>,
+        p1: Vec3,
+        v1: f32,
+        g1: Option<Vec3>,
+    ) -> Vec3 {
+        let iso = self.iso;
+        let t_lin = ((iso - v0) / (v1 - v0 + 1e-8)).clamp(0.0, 1.0);
+        let p_lin = p0 + (p1 - p0) * t_lin;
+
+        if !self.use_gradient_snap {
+            return p_lin;
+        }
+
+        // Use the gradient from the nearer corner if available.
+        let (ref_point, ref_value, grad_opt) = if (iso - v0).abs() < (iso - v1).abs() {
+            (p0, v0, g0)
+        } else {
+            (p1, v1, g1)
+        };
+
+        if let Some(g) = grad_opt {
+            let denom = g.dot(g).max(1e-12);
+            let step = (ref_value - iso) / denom;
+            let p_newton = ref_point - g * step;
+            // Blend to avoid overshoot; 0.5 is a pragmatic default.
+            return p_lin * 0.5 + p_newton * 0.5;
+        }
+
+        p_lin
+    }
+}
+
+/// Tiny symmetric QEF accumulator and solver for dual contouring.
+#[derive(Copy, Clone, Debug, Default)]
+struct Qef {
+    ata: [[f32; 3]; 3],
+    atb: Vec3,
+}
+
+impl Qef {
+    /// Add a constraint (p·n = const) to the system.
+    fn add(&mut self, p: Vec3, n: Vec3) {
+        self.ata[0][0] += n.x * n.x;
+        self.ata[0][1] += n.x * n.y;
+        self.ata[0][2] += n.x * n.z;
+        self.ata[1][1] += n.y * n.y;
+        self.ata[1][2] += n.y * n.z;
+        self.ata[2][2] += n.z * n.z;
+
+        let b = n.dot(p);
+        self.atb.x += n.x * b;
+        self.atb.y += n.y * b;
+        self.atb.z += n.z * b;
+    }
+
+    /// Solve the normal equations `A^T A x = A^T b` via a closed-form 3x3 inverse.
+    /// Returns `None` when the system is ill-conditioned.
+    fn solve(&self) -> Option<Vec3> {
+        let a00 = self.ata[0][0];
+        let a01 = self.ata[0][1];
+        let a02 = self.ata[0][2];
+        let a11 = self.ata[1][1];
+        let a12 = self.ata[1][2];
+        let a22 = self.ata[2][2];
+
+        // Symmetric completion.
+        let det = a00 * (a11 * a22 - a12 * a12) - a01 * (a01 * a22 - a12 * a02)
+            + a02 * (a01 * a12 - a11 * a02);
+
+        // Ill-conditioned system.
+        if det.abs() < 1e-10 || !det.is_finite() {
+            return None;
+        }
+
+        let inv_det = 1.0 / det;
+        let c00 = (a11 * a22 - a12 * a12) * inv_det;
+        let c01 = (a02 * a12 - a01 * a22) * inv_det;
+        let c02 = (a01 * a12 - a02 * a11) * inv_det;
+        let c11 = (a00 * a22 - a02 * a02) * inv_det;
+        let c12 = (a02 * a01 - a00 * a12) * inv_det;
+        let c22 = (a00 * a11 - a01 * a01) * inv_det;
+
+        let b = self.atb;
+        let x = c00 * b.x + c01 * b.y + c02 * b.z;
+        let y = c01 * b.x + c11 * b.y + c12 * b.z;
+        let z = c02 * b.x + c12 * b.y + c22 * b.z;
+
+        let candidate = Vec3::new(x, y, z);
+        if candidate.x.is_finite() && candidate.y.is_finite() && candidate.z.is_finite() {
+            Some(candidate)
+        } else {
+            None
+        }
+    }
+}
+
+/// Compute a mass-point average for fallback DC vertices.
+fn mass_point(points: &[Vec3]) -> Option<Vec3> {
+    if points.is_empty() {
+        return None;
+    }
+    let mut acc = Vec3::new(0.0, 0.0, 0.0);
+    for p in points {
+        acc += *p;
+    }
+    Some(acc / points.len() as f32)
+}
+
+/// Clamp `p` to the given AABB to avoid floating vertices far from the cell.
+fn clamp_to_aabb(p: Vec3, min: Vec3, max: Vec3) -> Vec3 {
+    Vec3::new(
+        p.x.clamp(min.x, max.x),
+        p.y.clamp(min.y, max.y),
+        p.z.clamp(min.z, max.z),
+    )
+}
+
+/// Scheduler responsible for ordering cells and dispatching sampling batches.
+pub struct IsoScheduler<'a, D, A, G, F>
+where
+    D: Domain,
+    A: ClosestAccel<D>,
+    G: BoundaryDirichlet,
+    F: SourceTerm,
+{
+    /// Global sampling parameters.
+    params: IsoParams,
+    /// Borrowed solver used for value/gradient estimates.
+    solver: &'a Solver<'a, D, A>,
+    /// Dirichlet boundary data.
+    boundary: &'a G,
+    /// Volume source term.
+    source: &'a F,
+    /// Storage for all known cells (indexed by queue entries).
+    cells: Vec<Cell>,
+    /// Priority queue of cell indices.
+    queue: BinaryHeap<QueuedCell>,
+    /// Monotonic counter to break priority ties.
+    seq: u64,
+    /// Marker tying the scheduler to the PDE traits.
+    _marker: PhantomData<(&'a Solver<'a, D, A>, &'a G, &'a F)>,
+}
+
+/// Refinement and convergence flags derived after sampling a cell.
+#[derive(Copy, Clone, Debug)]
+struct StepFlags {
+    /// Whether the current samples straddle the iso-value.
+    sign_change: bool,
+    /// Whether the cached variance exceeds tolerance.
+    variance_high: bool,
+    /// Whether the cell can still be subdivided.
+    can_subdivide: bool,
+    /// Whether the cell is converged (variance low or depth capped).
+    converged: bool,
+}
+
+impl<'a, D, A, G, F> IsoScheduler<'a, D, A, G, F>
+where
+    D: Domain,
+    A: ClosestAccel<D>,
+    G: BoundaryDirichlet,
+    F: SourceTerm,
+{
+    /// Create a scheduler seeded with a root cell.
+    pub fn new(
+        params: IsoParams,
+        mut root: Cell,
+        solver: &'a Solver<'a, D, A>,
+        boundary: &'a G,
+        source: &'a F,
+    ) -> Self {
+        root.reset_rng(params.base_seed);
+        let mut cells = Vec::new();
+        let queue = BinaryHeap::new();
+        cells.push(root);
+        let mut sched = Self {
+            params,
+            solver,
+            boundary,
+            source,
+            cells,
+            queue,
+            seq: 0,
+            _marker: PhantomData,
+        };
+        sched.push_index(0);
+        sched
+    }
+
+    /// Pop the highest-priority cell index.
+    pub fn next_cell(&mut self) -> Option<usize> {
+        self.queue.pop().map(|entry| entry.cell_index)
+    }
+
+    /// Access an immutable view of a cell by index.
+    pub fn cell(&self, index: usize) -> Option<&Cell> {
+        self.cells.get(index)
+    }
+
+    /// Perform one scheduler iteration: sample a cell, update statistics, and refine or requeue.
+    /// Also mesh converged cells using `mesher`.
+    pub fn step(&mut self, mesher: &Mesher) -> Option<MeshDelta> {
+        self.step_batch(mesher, Some(1))
+    }
+
+    /// Process up to `max_cells` (or the whole queue if `None`), meshing converged cells
+    /// and concatenating their geometry into a single `MeshDelta`.
+    ///
+    /// This is useful for stitching per-frame batches without imposing a global vertex
+    /// deduplication policy. Indices are offset internally so callers can append the
+    /// returned `MeshDelta` directly to their accumulated mesh. Returns `None` when
+    /// no cells were processed (e.g., the queue was empty).
+    pub fn step_batch(&mut self, mesher: &Mesher, max_cells: Option<usize>) -> Option<MeshDelta> {
+        let mut processed = 0usize;
+        let mut accum = MeshDelta::default();
+
+        while max_cells.map_or(true, |limit| processed < limit) {
+            // Dequeue the next cell to process.
+            let Some(idx) = self.next_cell() else {
+                break;
+            };
+            // Sample and compute refinement flags.
+            let flags = self.sample_and_flags(idx);
+
+            // Subdivide cells that need refinement.
+            let subdivided = if (flags.sign_change || flags.variance_high) && flags.can_subdivide {
+                self.spawn_children(idx);
+                true
+            } else {
+                false
+            };
+
+            // Requeue non-converged cells that were not subdivided.
+            if !flags.converged {
+                if flags.variance_high && !subdivided {
+                    self.push_index(idx);
+                } else if flags.sign_change && !subdivided && !flags.variance_high {
+                    self.push_index(idx);
+                }
+            }
+
+            // Mesh converged cells.
+            if flags.converged {
+                let delta = self.mesh_ready_cell(idx, mesher);
+                let base = accum.vertices.len() as u32;
+                accum.indices.extend(
+                    delta
+                        .indices
+                        .into_iter()
+                        .map(|[a, b, c]| [a + base, b + base, c + base]),
+                );
+                accum.vertices.extend(delta.vertices);
+            }
+
+            processed = processed.saturating_add(1);
+        }
+
+        if processed == 0 { None } else { Some(accum) }
+    }
+
+    /// Push children derived from a parent cell into storage and queue.
+    pub fn enqueue_children(&mut self, children: &[Cell; 8]) -> [usize; 8] {
+        core::array::from_fn(|i| {
+            let idx = self.cells.len();
+            self.cells.push(children[i].clone());
+            self.push_index(idx);
+            idx
+        })
+    }
+
+    /// Push a cell index into the priority queue based on its cached variance.
+    fn push_index(&mut self, index: usize) {
+        let variance = self
+            .cells
+            .get(index)
+            .map(|c| c.variance())
+            .unwrap_or(0.0_f32);
+        let key = PriorityKey::new(variance, self.cells[index].depth(), self.seq);
+        self.seq = self.seq.saturating_add(1);
+        self.queue.push(QueuedCell {
+            key,
+            cell_index: index,
+        });
+    }
+
+    /// Sample a cell and compute refinement flags in one pass.
+    fn sample_and_flags(&mut self, idx: usize) -> StepFlags {
+        // Borrow target cell mutably without aliasing the vector.
+        let (_, tail) = self.cells.split_at_mut(idx);
+        let cell = tail.first_mut().expect("queued index must exist");
+        let params = self.params;
+        let solver = self.solver;
+        let boundary = self.boundary;
+        let source = self.source;
+
+        Self::sample_cell(cell, params, solver, boundary, source);
+        cell.refresh_variance();
+
+        let sign = Self::has_sign_change(cell, params.iso_value, params.sample_center);
+        let variance_high = cell.variance() > params.variance_tol;
+        let can_subdivide = cell.can_subdivide(params.max_depth);
+        let converged = cell.is_converged(&params);
+
+        StepFlags {
+            sign_change: sign,
+            variance_high,
+            can_subdivide,
+            converged,
+        }
+    }
+
+    /// Sample all corners (and optionally center) once per batch iteration.
+    fn sample_cell(
+        cell: &mut Cell,
+        params: IsoParams,
+        solver: &Solver<'a, D, A>,
+        boundary: &G,
+        source: &F,
+    ) {
+        let corners = cell.corner_positions();
+        for _ in 0..params.batch_samples {
+            for (i, p) in corners.iter().enumerate() {
+                let val = Self::sample_value(cell, *p, params, solver, boundary, source);
+                cell.samples_mut()[i].push(val);
+                if let Some(gradp) = params.grad {
+                    let g = Self::sample_grad(cell, *p, gradp, params, solver, boundary, source);
+                    let count = cell.samples()[i].count().max(1);
+                    Self::accumulate_vec3(&mut cell.corner_grads_mut()[i], count, g);
+                }
+            }
+
+            if params.sample_center {
+                let center_pos = cell.center();
+                let val = Self::sample_value(cell, center_pos, params, solver, boundary, source);
+                cell.center_stats_mut().push(val);
+                if let Some(gradp) = params.grad {
+                    let g = Self::sample_grad(
+                        cell, center_pos, gradp, params, solver, boundary, source,
+                    );
+                    let count = cell.center_stats().count().max(1);
+                    Self::accumulate_vec3(cell.center_grad_mut(), count, g);
+                }
+            }
+        }
+    }
+
+    /// Single value sample via the Poisson Dirichlet estimator.
+    fn sample_value(
+        cell: &mut Cell,
+        p: Vec3,
+        params: IsoParams,
+        solver: &Solver<'a, D, A>,
+        boundary: &G,
+        source: &F,
+    ) -> f32 {
+        solver.poisson_dirichlet(
+            boundary,
+            source,
+            params.walk,
+            params.poisson,
+            cell.rng_mut(),
+            p,
+        )
+    }
+
+    /// Optional gradient sample via the Poisson gradient estimator.
+    fn sample_grad(
+        cell: &mut Cell,
+        p: Vec3,
+        grad: GradParams,
+        params: IsoParams,
+        solver: &Solver<'a, D, A>,
+        boundary: &G,
+        source: &F,
+    ) -> Vec3 {
+        solver.poisson_gradient(
+            boundary,
+            source,
+            params.walk,
+            params.poisson,
+            grad,
+            cell.rng_mut(),
+            p,
+        )
+    }
+
+    /// Detect whether the current statistics cross the iso-value.
+    fn has_sign_change(cell: &Cell, iso: f32, include_center: bool) -> bool {
+        let mut min_v = f32::INFINITY;
+        let mut max_v = f32::NEG_INFINITY;
+        let mut seen = false;
+
+        for s in cell.samples().iter() {
+            if s.count() > 0 {
+                seen = true;
+                min_v = min_v.min(s.mean());
+                max_v = max_v.max(s.mean());
+            }
+        }
+
+        if include_center && cell.center_stats().count() > 0 {
+            seen = true;
+            min_v = min_v.min(cell.center_stats().mean());
+            max_v = max_v.max(cell.center_stats().mean());
+        }
+
+        seen && min_v <= iso && max_v >= iso && (min_v < iso || max_v > iso)
+    }
+
+    /// Subdivide a cell and enqueue its children with deterministic seeds.
+    fn spawn_children(&mut self, parent_index: usize) {
+        let base_seed = self.params.base_seed;
+        let seeds = core::array::from_fn(|i| Self::child_seed(base_seed, parent_index, i as u8));
+
+        let children = {
+            let parent = self
+                .cells
+                .get(parent_index)
+                .expect("parent must exist")
+                .clone();
+            parent.subdivide_with_seeds(seeds)
+        };
+
+        if let Some(parent) = self.cells.get_mut(parent_index) {
+            let cloned = core::array::from_fn(|i| Some(Box::new(children[i].clone())));
+            *parent.children_mut() = cloned;
+        }
+
+        self.enqueue_children(&children);
+    }
+
+    /// Mesh a converged cell into a `MeshDelta`, cloning only the minimal data.
+    fn mesh_ready_cell(&self, index: usize, mesher: &Mesher) -> MeshDelta {
+        let cell = self
+            .cells
+            .get(index)
+            .expect("cell index must exist during meshing");
+        debug_assert!(
+            cell.is_converged(&self.params),
+            "meshing should be gated on convergence"
+        );
+
+        let positions = cell.corner_positions();
+        let values = cell.corner_means();
+        let grads = cell.corner_grads();
+        let gradients = if grads.iter().any(|g| g.is_some()) {
+            Some(grads)
+        } else {
+            None
+        };
+
+        mesher.mesh_cell(values, gradients, positions)
+    }
+
+    /// Combine base seed, parent index, and child id to produce a per-child seed.
+    fn child_seed(base: u64, parent_index: usize, child: u8) -> u64 {
+        let mix = (parent_index as u64).wrapping_mul(0x9E37_79B9_7F4A_7C15)
+            ^ ((child as u64) << 32)
+            ^ base;
+        mix ^ 0xD1B5_4A32_D192_ED03
+    }
+
+    /// Incremental mean update for gradients.
+    fn accumulate_vec3(slot: &mut Option<Vec3>, count: u32, sample: Vec3) {
+        let c = count as f32;
+        match slot {
+            Some(mean) => {
+                *mean = (*mean * (c - 1.0) + sample) / c;
+            }
+            None => {
+                *slot = Some(sample);
+            }
+        }
+    }
+}
+
+/// Ordering key for the priority queue (max-heap on variance, then depth, then FIFO).
+#[derive(Copy, Clone, Debug, PartialEq)]
+struct PriorityKey {
+    /// Cached variance used as the primary priority.
+    variance: f32,
+    /// Depth used to break ties (shallower first).
+    depth: u8,
+    /// Sequence number used to enforce FIFO within identical priority.
+    seq: u64,
+}
+
+impl PriorityKey {
+    /// Create a key with explicit fields; variance must be finite.
+    fn new(variance: f32, depth: u8, seq: u64) -> Self {
+        Self {
+            variance,
+            depth,
+            seq,
+        }
+    }
+}
+
+impl Eq for PriorityKey {}
+
+impl Ord for PriorityKey {
+    fn cmp(&self, other: &Self) -> Ordering {
+        match self
+            .variance
+            .partial_cmp(&other.variance)
+            .unwrap_or(Ordering::Equal)
+        {
+            Ordering::Equal => match self.depth.cmp(&other.depth) {
+                Ordering::Equal => self.seq.cmp(&other.seq),
+                // Prefer shallower nodes first.
+                ord => ord.reverse(),
+            },
+            // BinaryHeap is a max-heap; keep higher variance first.
+            ord => ord,
+        }
+    }
+}
+
+impl PartialOrd for PriorityKey {
+    fn partial_cmp(&self, other: &Self) -> Option<Ordering> {
+        Some(self.cmp(other))
+    }
+}
+
+/// Heap payload holding a cell index and its priority.
+#[derive(Copy, Clone, Debug, Eq, PartialEq)]
+struct QueuedCell {
+    /// Priority key.
+    key: PriorityKey,
+    /// Index into `IsoScheduler::cells`.
+    cell_index: usize,
+}
+
+impl Ord for QueuedCell {
+    fn cmp(&self, other: &Self) -> Ordering {
+        self.key.cmp(&other.key)
+    }
+}
+
+impl PartialOrd for QueuedCell {
+    fn partial_cmp(&self, other: &Self) -> Option<Ordering> {
+        Some(self.cmp(other))
+    }
+}
+
+/// Cube→tetrahedron decomposition: six tets referencing cube corner indices (Morton order).
+const TETS: [[usize; 4]; 6] = [
+    [0, 5, 1, 6],
+    [0, 1, 2, 6],
+    [0, 2, 3, 6],
+    [0, 3, 7, 6],
+    [0, 7, 4, 6],
+    [0, 4, 5, 6],
+];
+
+/// Tetrahedron edges as corner pairs (local tet indices 0..3).
+const TET_EDGES: [(usize, usize); 6] = [(0, 1), (1, 2), (2, 0), (0, 3), (1, 3), (2, 3)];
+
+/// Cube edges in Morton corner order.
+const CUBE_EDGES: [(usize, usize); 12] = [
+    (0, 1),
+    (1, 3),
+    (3, 2),
+    (2, 0),
+    (4, 5),
+    (5, 7),
+    (7, 6),
+    (6, 4),
+    (0, 4),
+    (1, 5),
+    (3, 7),
+    (2, 6),
+];
+
+/// Faces as lists of edge ids (Morton order), matching `FACE_NORMALS`.
+const FACE_EDGES: [[i8; 4]; 6] = [
+    [3, 7, 8, 11],  // -X
+    [0, 5, 9, 10],  // +X
+    [0, 4, 8, 9],   // -Y
+    [2, 6, 10, 11], // +Y
+    [0, 1, 2, 3],   // -Z
+    [4, 5, 6, 7],   // +Z
+];
+
+/// Outward face normals for each face in `FACE_EDGES`.
+const FACE_NORMALS: [Vec3; 6] = [
+    Vec3::new(-1.0, 0.0, 0.0),
+    Vec3::new(1.0, 0.0, 0.0),
+    Vec3::new(0.0, -1.0, 0.0),
+    Vec3::new(0.0, 1.0, 0.0),
+    Vec3::new(0.0, 0.0, -1.0),
+    Vec3::new(0.0, 0.0, 1.0),
+];
+
+/// Marching tetrahedra triangle table for masks 0..7 (inside = value>iso).
+const TET_TRI_TABLE_POS: [&[[i8; 3]]; 8] = [
+    &[],                     // 0: no vertices inside
+    &[[0, 3, 2]],            // 1: 1 vertex inside
+    &[[0, 1, 4]],            // 2: 1 vertex inside
+    &[[1, 4, 2], [2, 4, 3]], // 3: 2 vertices inside
+    &[[1, 2, 5]],
+    &[[0, 3, 5], [0, 5, 1]],
+    &[[0, 2, 5], [0, 5, 4]],
+    &[[5, 4, 3]],
+];
+
+/// Complementary triangle table for masks 8..15 (outside mirrored); orientation preserved.
+const TET_TRI_TABLE_NEG: [&[[i8; 3]]; 8] = [
+    &[],
+    &[[3, 4, 5]],
+    &[[0, 5, 4], [0, 3, 5]],
+    &[[1, 5, 0], [5, 2, 0]],
+    &[[2, 3, 4], [2, 4, 1]],
+    &[[1, 4, 0], [4, 3, 0]],
+    &[[2, 3, 0], [3, 4, 0]],
+    &[],
+];
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use alloc::vec;
+
+    /// Helper to build a unit cube root cell with a fixed seed.
+    fn root_cell() -> Cell {
+        Cell::new(
+            Vec3::new(0.0, 0.0, 0.0),
+            Vec3::new(1.0, 1.0, 1.0),
+            0,
+            0xDEAD_BEEF,
+        )
+    }
+
+    #[test]
+    fn priority_queue_orders_by_variance_then_depth() {
+        let mut a = root_cell();
+        a.set_variance(0.1);
+        let mut b = root_cell();
+        b.set_variance(0.5);
+        let mut c = root_cell();
+        c.set_variance(0.5);
+        c.set_depth(2);
+
+        fn phi(p: Vec3) -> f32 {
+            p.length() - 2.0
+        }
+        fn g0(_p: Vec3) -> f32 {
+            0.0
+        }
+        let domain: crate::SdfDomain<fn(Vec3) -> f32> = crate::SdfDomain::new(phi);
+        let accel = crate::ClosestNaive;
+        let solver = crate::Solver::builder(&domain, &accel).build();
+        let boundary = crate::BoundaryDirichletFn::new(g0 as fn(Vec3) -> f32);
+        let source = ZeroSource;
+
+        let params = IsoParams::new(
+            0.0,
+            0.01,
+            4,
+            WalkBudget::new(1e-3, 16),
+            PoissonParams::new(1),
+        );
+        let mut sched = IsoScheduler::new(params, a, &solver, &boundary, &source);
+
+        // Push extra cells manually to test ordering.
+        sched.cells.push(b);
+        sched.push_index(1);
+        sched.cells.push(c);
+        sched.push_index(2);
+
+        let first = sched.next_cell().unwrap();
+        let second = sched.next_cell().unwrap();
+        let third = sched.next_cell().unwrap();
+
+        assert_eq!(first, 1, "highest variance should pop first");
+        assert_eq!(
+            second, 2,
+            "equal variance prefers shallower depth; shallower (b) was popped first, so deeper pops next"
+        );
+        assert_eq!(third, 0, "lowest variance pops last");
+    }
+
+    #[test]
+    fn cell_subdivide_splits_bounds() {
+        let cell = root_cell();
+        let seeds = core::array::from_fn(|i| i as u64 + 1);
+        let children = cell.subdivide_with_seeds(seeds);
+        for (i, child) in children.iter().enumerate() {
+            assert_eq!(child.depth(), 1);
+            let mid = cell.center();
+            let min = child.bbox_min();
+            let max = child.bbox_max();
+            // Each child spans half the parent in every dimension.
+            assert!(
+                (max.x - min.x - 0.5).abs() < 1e-6,
+                "child {i} x extent wrong"
+            );
+            assert!(
+                (max.y - min.y - 0.5).abs() < 1e-6,
+                "child {i} y extent wrong"
+            );
+            assert!(
+                (max.z - min.z - 0.5).abs() < 1e-6,
+                "child {i} z extent wrong"
+            );
+            // Midpoint placement sanity: child min/max must align to parent min/mid/max.
+            assert!(
+                (min.x - cell.bbox_min().x).abs() < 1e-6
+                    || (min.x - mid.x).abs() < 1e-6
+                    || (min.x - cell.bbox_max().x).abs() < 1e-6
+            );
+            assert!(
+                (max.x - cell.bbox_min().x).abs() < 1e-6
+                    || (max.x - mid.x).abs() < 1e-6
+                    || (max.x - cell.bbox_max().x).abs() < 1e-6
+            );
+            assert!(
+                (min.y - cell.bbox_min().y).abs() < 1e-6
+                    || (min.y - mid.y).abs() < 1e-6
+                    || (min.y - cell.bbox_max().y).abs() < 1e-6
+            );
+        }
+    }
+
+    #[test]
+    fn step_updates_stats_and_requeues_when_variance_high() {
+        fn phi(p: Vec3) -> f32 {
+            p.length() - 2.0
+        }
+        fn g0(_p: Vec3) -> f32 {
+            0.0
+        }
+        let domain: crate::SdfDomain<fn(Vec3) -> f32> = crate::SdfDomain::new(phi);
+        let accel = crate::ClosestNaive;
+        let solver = crate::Solver::builder(&domain, &accel).build();
+        let boundary = crate::BoundaryDirichletFn::new(g0 as fn(Vec3) -> f32);
+        let source = ZeroSource;
+
+        let root = Cell::new(
+            Vec3::new(-0.5, -0.5, -0.5),
+            Vec3::new(0.5, 0.5, 0.5),
+            0,
+            0xCAFEBABE,
+        );
+        // Negative tolerance guarantees variance_high=true after sampling.
+        let params = IsoParams::new(
+            0.0,
+            -1.0,
+            1,
+            WalkBudget::new(1e-3, 8),
+            PoissonParams::new(1),
+        )
+        .with_batch_samples(2)
+        .with_base_seed(0xBEEFBEEF);
+        let mesher = Mesher::new(params.iso_value);
+
+        let mut sched = IsoScheduler::new(params, root, &solver, &boundary, &source);
+        let _ = sched.step(&mesher);
+
+        let cell = sched.cell(0).unwrap();
+        assert!(
+            cell.samples().iter().all(|s| s.count() >= 2),
+            "all corners should receive samples"
+        );
+        assert!(
+            cell.center_stats().count() >= 2,
+            "center should receive samples when enabled"
+        );
+        // Variance high forced requeue; queue should not be empty.
+        assert!(
+            !sched.queue.is_empty(),
+            "variance trigger should requeue when not subdividing"
+        );
+    }
+
+    #[test]
+    fn cell_convergence_requires_samples_and_depth_or_variance() {
+        let mut cell = root_cell();
+        let params = IsoParams::new(
+            0.0,
+            0.01,
+            1,
+            WalkBudget::new(1e-3, 8),
+            PoissonParams::new(1),
+        );
+
+        assert!(
+            !cell.is_converged(&params),
+            "unsampled cell should not report convergence"
+        );
+
+        // Seed minimal samples to make the variance calculation meaningful.
+        for s in cell.samples_mut().iter_mut() {
+            s.push(0.5);
+        }
+        cell.center_stats_mut().push(0.25);
+        cell.refresh_variance();
+        assert!(
+            cell.is_converged(&params),
+            "low-variance cell with samples should converge"
+        );
+
+        // Force high variance but clamp depth to max_depth so it still converges.
+        cell.set_variance(10.0);
+        cell.set_depth(params.max_depth);
+        assert!(
+            cell.is_converged(&params),
+            "depth-capped cell should count as converged even with high variance"
+        );
+    }
+
+    #[test]
+    fn converged_max_depth_meshes_once() {
+        fn phi(p: Vec3) -> f32 {
+            p.length() - 1.0
+        }
+        fn g0(_p: Vec3) -> f32 {
+            0.0
+        }
+
+        let domain: crate::SdfDomain<fn(Vec3) -> f32> = crate::SdfDomain::new(phi);
+        let accel = crate::ClosestNaive;
+        let solver = crate::Solver::builder(&domain, &accel).build();
+        let boundary = crate::BoundaryDirichletFn::new(g0 as fn(Vec3) -> f32);
+        let source = ZeroSource;
+
+        let root = Cell::new(
+            Vec3::new(-0.5, -0.5, -0.5),
+            Vec3::new(0.5, 0.5, 0.5),
+            0,
+            0xBAD5EED,
+        );
+
+        // max_depth = 0 forces convergence after first sampling pass.
+        let params = IsoParams::new(
+            0.0,
+            0.01,
+            0,
+            WalkBudget::new(1e-3, 8),
+            PoissonParams::new(1),
+        );
+        let mesher = Mesher::new(params.iso_value);
+
+        let mut sched = IsoScheduler::new(params, root, &solver, &boundary, &source);
+
+        let delta = sched.step(&mesher).expect("root cell should exist");
+        assert!(
+            delta.indices.len() <= delta.vertices.len(),
+            "mesh delta should remain consistent"
+        );
+        assert!(
+            sched.next_cell().is_none(),
+            "converged cell at max depth should not be requeued"
+        );
+    }
+
+    /// Predicate: returns true when the cell corners (or center) straddle the iso-value.
+    fn cell_straddles<F>(cell: &Cell, sdf: F, iso: f32) -> bool
+    where
+        F: Fn(Vec3) -> f32,
+    {
+        let positions = cell.corner_positions();
+        let mut min_v = f32::INFINITY;
+        let mut max_v = f32::NEG_INFINITY;
+        for p in positions.iter() {
+            let v = sdf(*p);
+            min_v = min_v.min(v);
+            max_v = max_v.max(v);
+        }
+        let center_v = sdf(cell.center());
+        min_v = min_v.min(center_v);
+        max_v = max_v.max(center_v);
+        min_v <= iso && max_v >= iso && (min_v < iso || max_v > iso)
+    }
+
+    /// Adaptively refine only cells that straddle the iso-surface, up to `target_depth`.
+    fn narrow_band_cells<F>(root: Cell, target_depth: u8, sdf: F, iso: f32) -> Vec<Cell>
+    where
+        F: Fn(Vec3) -> f32 + Copy,
+    {
+        let mut frontier = vec![root];
+        let mut seed_counter = 1u64;
+        let free_levels = core::cmp::min(3, target_depth);
+        for level in 0..target_depth {
+            let mut next = Vec::new();
+            for cell in frontier.into_iter() {
+                // Always expand the root (level 0) to avoid missing enclosed features
+                // such as torus holes whose corners and center may all have the same sign.
+                if level >= free_levels && !cell_straddles(&cell, sdf, iso) {
+                    continue;
+                }
+                let seeds = core::array::from_fn(|_| {
+                    let s = seed_counter;
+                    seed_counter = seed_counter.saturating_add(1);
+                    s
+                });
+                let children = cell.subdivide_with_seeds(seeds);
+                next.extend(children.into_iter());
+            }
+            frontier = next;
+        }
+
+        let band: Vec<Cell> = frontier
+            .iter()
+            .cloned()
+            .filter(|c| cell_straddles(c, sdf, iso))
+            .collect();
+        if band.is_empty() { frontier } else { band }
+    }
+
+    /// Signed distance to a sphere of radius `r` at the origin.
+    fn sphere_sdf(p: Vec3, r: f32) -> f32 {
+        p.length() - r
+    }
+
+    /// Outward gradient for the sphere SDF; returns zero at the origin.
+    fn sphere_grad(p: Vec3) -> Vec3 {
+        let len = p.length();
+        if len > 1e-6 {
+            p / len
+        } else {
+            Vec3::new(0.0, 0.0, 0.0)
+        }
+    }
+
+    /// Signed distance to an axis-aligned box centered at the origin with half-extent `h`.
+    fn box_sdf(p: Vec3, h: f32) -> f32 {
+        let q = p.abs() - Vec3::new(h, h, h);
+        let outside = Vec3::new(q.x.max(0.0), q.y.max(0.0), q.z.max(0.0));
+        let outside_len = outside.length();
+        let inside = q.x.max(q.y.max(q.z)).min(0.0);
+        outside_len + inside
+    }
+
+    /// Signed distance to a torus centered at origin lying in the XZ plane.
+    fn torus_sdf(p: Vec3, major: f32, minor: f32) -> f32 {
+        let w = Vec3::new(p.x, 0.0, p.z);
+        let q = Vec3::new(w.length() - major, p.y, 0.0);
+        q.length() - minor
+    }
+
+    /// Gradient of the torus SDF; returns an arbitrary up-vector when degenerate.
+    fn torus_grad(p: Vec3, major: f32) -> Vec3 {
+        let w = Vec3::new(p.x, 0.0, p.z);
+        let len_w = w.length();
+        let qx = len_w - major;
+        let q = Vec3::new(qx, p.y, 0.0);
+        let len_q = q.length();
+        if len_q < 1e-6 || len_w < 1e-6 {
+            return Vec3::new(0.0, 1.0, 0.0);
+        }
+        let inv_q = 1.0 / len_q;
+        let inv_w = 1.0 / len_w;
+        let dqx_dx = w.x * inv_w;
+        let dqx_dz = w.z * inv_w;
+        Vec3::new(qx * dqx_dx * inv_q, q.y * inv_q, qx * dqx_dz * inv_q)
+    }
+
+    /// Mesh a batch of cells and return the maximum vertex distance to the target surface.
+    /// Optionally checks triangle winding against an outward gradient field.
+    fn mesh_error_for_cells<F, G>(
+        cells: &[Cell],
+        mesher: &Mesher,
+        sdf: F,
+        grad: Option<G>,
+        check_winding: bool,
+    ) -> (f32, bool)
+    where
+        F: Fn(Vec3) -> f32,
+        G: Fn(Vec3) -> Vec3,
+    {
+        let mut max_dist = 0.0_f32;
+        let mut outward_ok = true;
+
+        for cell in cells {
+            let positions = cell.corner_positions();
+            let values = core::array::from_fn(|i| sdf(positions[i]));
+            let gradients = match grad.as_ref() {
+                Some(g) => Some(core::array::from_fn(|i| Some(g(positions[i])))),
+                None => None,
+            };
+
+            let delta = mesher.mesh_cell(values, gradients, positions);
+            for &v in delta.vertices.iter() {
+                max_dist = max_dist.max(sdf(v).abs());
+            }
+
+            if check_winding {
+                for tri in delta.indices.iter() {
+                    let p0 = delta.vertices[tri[0] as usize];
+                    let p1 = delta.vertices[tri[1] as usize];
+                    let p2 = delta.vertices[tri[2] as usize];
+                    let n = (p1 - p0).cross(p2 - p0);
+                    if n.length() < 1e-8 {
+                        continue;
+                    }
+                    let centroid = (p0 + p1 + p2) / 3.0;
+                    let grad_dir = grad.as_ref().map(|g| g(centroid)).unwrap_or(centroid);
+                    if n.dot(grad_dir) < -1e-5 {
+                        outward_ok = false;
+                        break;
+                    }
+                }
+            }
+        }
+
+        (max_dist, outward_ok)
+    }
+
+    #[test]
+    fn mesher_sphere_vertices_close_and_outward() {
+        let root = Cell::new(Vec3::new(-1.1, -1.1, -1.1), Vec3::new(1.1, 1.1, 1.1), 0, 42);
+        let cells = narrow_band_cells(root, 8, |p| sphere_sdf(p, 1.0), 0.0);
+        let mesher = Mesher::new(0.0);
+
+        assert!(!cells.is_empty(),);
+
+        let (max_dist, outward_ok) = mesh_error_for_cells(
+            &cells,
+            &mesher,
+            |p| sphere_sdf(p, 1.0),
+            Some(sphere_grad),
+            true,
+        );
+
+        assert!(
+            max_dist < 1e-2,
+            "sphere vertices should hug the surface (max dist {max_dist})"
+        );
+        assert!(outward_ok, "triangle winding should point outward");
+    }
+
+    #[test]
+    fn mesher_box_vertices_close() {
+        let root = Cell::new(
+            Vec3::new(-1.05, -1.05, -1.05),
+            Vec3::new(1.05, 1.05, 1.05),
+            0,
+            7,
+        );
+        let cells = narrow_band_cells(root, 8, |p| box_sdf(p, 1.0), 0.0);
+        let mesher = Mesher::new(0.0);
+
+        assert!(!cells.is_empty(),);
+
+        let (max_dist, outward_ok) = mesh_error_for_cells(
+            &cells,
+            &mesher,
+            |p| box_sdf(p, 1.0),
+            None::<fn(Vec3) -> Vec3>,
+            false,
+        );
+
+        assert!(
+            max_dist < 1e-2,
+            "box vertices should stay close to the implicit surface (max dist {max_dist})"
+        );
+        assert!(outward_ok, "winding not checked; should remain true");
+    }
+
+    #[test]
+    fn mesher_torus_vertices_close() {
+        let root = Cell::new(Vec3::new(-1.1, -1.1, -1.1), Vec3::new(1.1, 1.1, 1.1), 0, 9);
+        let cells = narrow_band_cells(root, 7, |p| torus_sdf(p, 0.75, 0.25), 0.0);
+        let mesher = Mesher::new(0.0);
+
+        assert!(!cells.is_empty(),);
+
+        let (max_dist, outward_ok) = mesh_error_for_cells(
+            &cells,
+            &mesher,
+            |p| torus_sdf(p, 0.75, 0.25),
+            Some(|p| torus_grad(p, 0.75)),
+            false,
+        );
+
+        assert!(
+            max_dist < 2e-2,
+            "torus vertices should stay close to the implicit surface (max dist {max_dist})"
+        );
+        assert!(outward_ok, "winding not checked; should remain true");
+    }
+
+    #[test]
+    fn dc_mesher_sphere_vertices_close_and_outward() {
+        let root = Cell::new(Vec3::new(-1.1, -1.1, -1.1), Vec3::new(1.1, 1.1, 1.1), 0, 11);
+        let cells = narrow_band_cells(root, 7, |p| sphere_sdf(p, 1.0), 0.0);
+        let mesher = Mesher::dual_contouring(0.0);
+
+        assert!(!cells.is_empty());
+
+        let (max_dist, outward_ok) = mesh_error_for_cells(
+            &cells,
+            &mesher,
+            |p| sphere_sdf(p, 1.0),
+            Some(sphere_grad),
+            true,
+        );
+
+        assert!(
+            max_dist < 3.5e-2,
+            "dc sphere vertices should hug the surface (max dist {max_dist})"
+        );
+        assert!(outward_ok, "dc triangle winding should point outward");
+    }
+
+    #[test]
+    fn dc_mesher_box_vertices_close() {
+        let root = Cell::new(
+            Vec3::new(-1.05, -1.05, -1.05),
+            Vec3::new(1.05, 1.05, 1.05),
+            0,
+            13,
+        );
+        let cells = narrow_band_cells(root, 7, |p| box_sdf(p, 1.0), 0.0);
+        let mesher = Mesher::dual_contouring(0.0);
+
+        assert!(!cells.is_empty());
+
+        let (max_dist, _) = mesh_error_for_cells(
+            &cells,
+            &mesher,
+            |p| box_sdf(p, 1.0),
+            None::<fn(Vec3) -> Vec3>,
+            false,
+        );
+
+        assert!(
+            max_dist < 2e-2,
+            "dc box vertices should stay close to the implicit surface (max dist {max_dist})"
+        );
+    }
+
+    #[test]
+    fn dc_mesher_torus_vertices_close() {
+        let root = Cell::new(Vec3::new(-1.1, -1.1, -1.1), Vec3::new(1.1, 1.1, 1.1), 0, 15);
+        let cells = narrow_band_cells(root, 7, |p| torus_sdf(p, 0.75, 0.25), 0.0);
+        let mesher = Mesher::dual_contouring(0.0);
+
+        assert!(!cells.is_empty());
+
+        let (max_dist, _) = mesh_error_for_cells(
+            &cells,
+            &mesher,
+            |p| torus_sdf(p, 0.75, 0.25),
+            Some(|p| torus_grad(p, 0.75)),
+            false,
+        );
+
+        assert!(
+            max_dist < 3e-2,
+            "dc torus vertices should stay close to the implicit surface (max dist {max_dist})"
+        );
+    }
+
+    #[test]
+    fn dc_mesher_degenerate_gradients_fallbacks() {
+        let cell = Cell::new(Vec3::new(-0.5, -0.5, -0.5), Vec3::new(0.5, 0.5, 0.5), 0, 21);
+        let corners = cell.corner_positions();
+        // Simple plane that crosses the cell.
+        let values = core::array::from_fn(|i| corners[i].x);
+        let grads: [Option<Vec3>; 8] = core::array::from_fn(|_| None);
+        let mesher = Mesher::dual_contouring(0.0).without_gradient_snap();
+        let delta = mesher.mesh_cell(values, Some(grads), corners);
+
+        assert!(
+            !delta.vertices.is_empty(),
+            "dc mesher should emit vertices even without gradients"
+        );
+        assert!(
+            delta
+                .vertices
+                .iter()
+                .all(|p| p.x.abs() < 0.51 && p.y.abs() < 0.51 && p.z.abs() < 0.51),
+            "dc fallback vertex should stay clamped to the cell"
+        );
+        assert!(
+            delta
+                .indices
+                .iter()
+                .all(|tri| tri[0] < delta.vertices.len() as u32),
+            "dc indices should reference in-bounds vertices"
+        );
+    }
+
+    #[test]
+    fn batch_meshing_matches_single_steps() {
+        fn phi(p: Vec3) -> f32 {
+            p.length() - 1.0
+        }
+        fn g_x(p: Vec3) -> f32 {
+            p.x
+        }
+
+        let domain: crate::SdfDomain<fn(Vec3) -> f32> = crate::SdfDomain::new(phi);
+        let accel = crate::ClosestNaive;
+        let solver = crate::Solver::builder(&domain, &accel).build();
+        let boundary = crate::BoundaryDirichletFn::new(g_x as fn(Vec3) -> f32);
+        let source = ZeroSource;
+
+        let root_a = Cell::new(
+            Vec3::new(-0.5, -0.5, -0.5),
+            Vec3::new(0.5, 0.5, 0.5),
+            0,
+            0xBABA_CAFE,
+        );
+        let root_b = root_a.clone();
+
+        let params = IsoParams::new(
+            -0.25,
+            -1.0,
+            2,
+            WalkBudget::new(1e-3, 8),
+            PoissonParams::new(1),
+        )
+        .with_batch_samples(2)
+        .with_base_seed(0x1234_5678_ABCD);
+
+        let mesher = Mesher::new(params.iso_value);
+
+        let mut sched_batch = IsoScheduler::new(params, root_a, &solver, &boundary, &source);
+        let batch_delta = sched_batch
+            .step_batch(&mesher, None)
+            .expect("batch step should process at least one cell");
+        assert!(
+            sched_batch.next_cell().is_none(),
+            "batch step should drain the queue when no limit is given"
+        );
+
+        let mut sched_single = IsoScheduler::new(params, root_b, &solver, &boundary, &source);
+        let mut accum = MeshDelta::default();
+        while let Some(delta) = sched_single.step(&mesher) {
+            let base = accum.vertices.len() as u32;
+            accum.indices.extend(
+                delta
+                    .indices
+                    .into_iter()
+                    .map(|[a, b, c]| [a + base, b + base, c + base]),
+            );
+            accum.vertices.extend(delta.vertices);
+        }
+
+        assert_eq!(
+            accum.vertices.len(),
+            batch_delta.vertices.len(),
+            "batch and single-step paths should yield identical vertex counts"
+        );
+        assert_eq!(
+            accum.indices.len(),
+            batch_delta.indices.len(),
+            "batch and single-step paths should yield identical triangle counts"
+        );
+        assert_eq!(accum.vertices, batch_delta.vertices);
+        assert_eq!(accum.indices, batch_delta.indices);
+
+        let vlen = accum.vertices.len() as u32;
+        assert!(
+            accum
+                .indices
+                .iter()
+                .all(|tri| tri[0] < vlen && tri[1] < vlen && tri[2] < vlen),
+            "indices must remain in-bounds after accumulation"
+        );
+    }
+
+    /// Constant zero source used in tests.
+    #[derive(Clone, Copy)]
+    struct ZeroSource;
+    impl SourceTerm for ZeroSource {
+        fn value(&self, _x: Vec3) -> f32 {
+            0.0
+        }
+    }
+}

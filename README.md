@@ -14,6 +14,8 @@ while embracing Rust’s safety and composability.
   same interface.
 - Stateless solver façade (`Solver`, `WalkBudget`) for ergonomic usage in
   `no_std` environments.
+- Progressive isosurface scaffolding: `IsoScheduler` refines cells by variance/sign-change
+  and meshes via marching tetrahedra or a local dual-contouring variant.
 - ASCII PLY dump format: vertices in walk order, RGB encodes role (start = cyan,
   steps = white, boundary hit = green, max-step exit = red).
 
@@ -38,3 +40,10 @@ WoS replaces volumetric grids with random walks in the continuous domain,
 yielding unbiased solutions with controllable variance and trivial
 parallelisation. This workspace provides a Rust-first, safe foundation for
 research and application-level experimentation.
+
+## Isosurface sampling
+
+`crates/zombie_rs/src/isosurface.rs` contains a progressive sampler/mesher that
+tracks an iso-value on SDF domains. Cells are refined when variance is high or
+sign changes are detected. Converged cells are meshed with either marching tets
+or a local dual-contouring mode.
