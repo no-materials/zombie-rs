@@ -307,6 +307,140 @@ pub struct MeshDelta {
     pub indices: Vec<[u32; 3]>,
 }
 
+/// Lightweight mesher that turns converged cells into triangle batches.
+///
+/// This struct is intentionally decoupled from the scheduler: callers pass in
+/// precomputed corner samples (and optional gradients) and receive a `MeshDelta`
+/// scoped to a single cell. Vertex de-duplication across cells is left to the
+/// caller to keep the mesher stateless and easily testable. Internally this uses
+/// marching tetrahedra (6 tets per cube) to avoid the large Marching Cubes table
+/// while still producing watertight meshes for most configurations.
+pub struct Mesher {
+    /// Iso-value to contour.
+    iso: f32,
+    /// Toggle for gradient snapping along edges.
+    use_gradient_snap: bool,
+}
+
+impl Mesher {
+    /// Create a mesher that extracts the iso-surface `iso`. Gradient snap is enabled by default.
+    pub fn new(iso: f32) -> Self {
+        Self {
+            iso,
+            use_gradient_snap: true,
+        }
+    }
+
+    /// Disable gradient-based snapping of edge intersections.
+    pub fn without_gradient_snap(self) -> Self {
+        Self {
+            use_gradient_snap: false,
+            ..self
+        }
+    }
+
+    /// Generate a mesh for a single cell using marching tetrahedra.
+    ///
+    /// The `corners` array is expected in Morton order (000..111). When gradients
+    /// are provided, a single Newton-style step is blended with linear interpolation
+    /// to tighten edge intersections; otherwise pure linear interpolation is used.
+    pub fn mesh_cell(
+        &self,
+        corners: [f32; 8],
+        gradients: Option<[Option<Vec3>; 8]>,
+        positions: [Vec3; 8],
+    ) -> MeshDelta {
+        let mut vertices = Vec::new();
+        let mut indices = Vec::new();
+
+        for tet in TETS {
+            // Build local values/positions for this tet.
+            let mut tv = [0f32; 4];
+            let mut tp = [Vec3::new(0.0, 0.0, 0.0); 4];
+            let mut tg: [Option<Vec3>; 4] = [None, None, None, None];
+            for (i, &cidx) in tet.iter().enumerate() {
+                tv[i] = corners[cidx];
+                tp[i] = positions[cidx];
+                if let Some(allg) = gradients.as_ref() {
+                    tg[i] = allg[cidx];
+                }
+            }
+
+            let mask = self.tet_mask(&tv);
+            for tri in Self::tet_tris(mask) {
+                let mut idx = [0u32; 3];
+                for (k, &edge_id) in tri.iter().enumerate() {
+                    let (c0, c1) = TET_EDGES[edge_id as usize];
+                    let p = self.edge_point(tp[c0], tv[c0], tg[c0], tp[c1], tv[c1], tg[c1]);
+                    idx[k] = vertices.len() as u32;
+                    vertices.push(p);
+                }
+                indices.push(idx);
+            }
+        }
+
+        MeshDelta { vertices, indices }
+    }
+
+    /// Compute the tetrahedron mask for marching tetrahedra.
+    fn tet_mask(&self, values: &[f32; 4]) -> u8 {
+        let mut mask = 0u8;
+        for (i, &v) in values.iter().enumerate() {
+            if v > self.iso {
+                mask |= 1 << i;
+            }
+        }
+        mask
+    }
+
+    /// Return triangle edge ids for a given tetrahedron mask (0..15), using symmetry to cover all cases.
+    fn tet_tris(mask: u8) -> &'static [[i8; 3]] {
+        let idx = (mask & 0x0F) as usize;
+        // Cases above 7 mirror the inside/outside assignment; reuse complements.
+        if idx <= 7 {
+            &TET_TRI_TABLE_POS[idx]
+        } else {
+            &TET_TRI_TABLE_NEG[15 - idx]
+        }
+    }
+
+    /// Interpolate an edge intersection, optionally blending a gradient snap.
+    fn edge_point(
+        &self,
+        p0: Vec3,
+        v0: f32,
+        g0: Option<Vec3>,
+        p1: Vec3,
+        v1: f32,
+        g1: Option<Vec3>,
+    ) -> Vec3 {
+        let iso = self.iso;
+        let t_lin = ((iso - v0) / (v1 - v0 + 1e-8)).clamp(0.0, 1.0);
+        let p_lin = p0 + (p1 - p0) * t_lin;
+
+        if !self.use_gradient_snap {
+            return p_lin;
+        }
+
+        // Use the gradient from the nearer corner if available.
+        let (ref_point, ref_value, grad_opt) = if (iso - v0).abs() < (iso - v1).abs() {
+            (p0, v0, g0)
+        } else {
+            (p1, v1, g1)
+        };
+
+        if let Some(g) = grad_opt {
+            let denom = g.dot(g).max(1e-12);
+            let step = (ref_value - iso) / denom;
+            let p_newton = ref_point - g * step;
+            // Blend to avoid overshoot; 0.5 is a pragmatic default.
+            return p_lin * 0.5 + p_newton * 0.5;
+        }
+
+        p_lin
+    }
+}
+
 /// Scheduler responsible for ordering cells and dispatching sampling batches.
 pub struct IsoScheduler<'a, D, A, G, F>
 where
@@ -655,6 +789,43 @@ impl PartialOrd for QueuedCell {
         Some(self.cmp(other))
     }
 }
+
+/// Cube→tetrahedron decomposition: six tets referencing cube corner indices (Morton order).
+const TETS: [[usize; 4]; 6] = [
+    [0, 5, 1, 6],
+    [0, 1, 2, 6],
+    [0, 2, 3, 6],
+    [0, 3, 7, 6],
+    [0, 7, 4, 6],
+    [0, 4, 5, 6],
+];
+
+/// Tetrahedron edges as corner pairs (local tet indices 0..3).
+const TET_EDGES: [(usize, usize); 6] = [(0, 1), (1, 2), (2, 0), (0, 3), (1, 3), (2, 3)];
+
+/// Marching tetrahedra triangle table for masks 0..7 (inside = value>iso).
+const TET_TRI_TABLE_POS: [&[[i8; 3]]; 8] = [
+    &[],                     // 0: no vertices inside
+    &[[0, 3, 2]],            // 1: 1 vertex inside
+    &[[0, 1, 4]],            // 2: 1 vertex inside
+    &[[1, 4, 2], [2, 4, 3]], // 3: 2 vertices inside
+    &[[1, 2, 5]],
+    &[[0, 3, 5], [0, 5, 1]],
+    &[[0, 2, 5], [0, 5, 4]],
+    &[[5, 4, 3]],
+];
+
+/// Complementary triangle table for masks 8..15 (outside mirrored); orientation preserved.
+const TET_TRI_TABLE_NEG: [&[[i8; 3]]; 8] = [
+    &[],
+    &[[3, 4, 5]],
+    &[[0, 5, 4], [0, 3, 5]],
+    &[[1, 5, 0], [5, 2, 0]],
+    &[[2, 3, 4], [2, 4, 1]],
+    &[[1, 4, 0], [4, 3, 0]],
+    &[[2, 3, 0], [3, 4, 0]],
+    &[],
+];
 
 #[cfg(test)]
 mod tests {
