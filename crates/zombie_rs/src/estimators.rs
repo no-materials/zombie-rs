@@ -5,8 +5,6 @@
 //! [`WalkOutcome`](crate::observer::WalkOutcome) that surfaces the termination
 //! reason so that higher-level orchestration (e.g. diagnostics) can react safely.
 
-use core::f32::consts::PI;
-
 use crate::accel::ClosestAccel;
 use crate::boundary::BoundaryDirichlet;
 use crate::domain::Domain;
@@ -20,8 +18,8 @@ use crate::params::{
 use crate::rng::Rng;
 use crate::sampling::{
     ball_volume, green_ball_3d, green_ball_3d_total_mass, sample_ball_by_green_pdf,
-    sample_ball_by_yukawa_pdf, sample_ball_uniform, wos_jump, yukawa_green_3d,
-    yukawa_normalization_3d, yukawa_total_mass_3d,
+    sample_ball_by_yukawa_pdf, sample_ball_uniform, sample_radius_under_grad_green_pdf,
+    sample_unit_sphere, wos_jump, yukawa_green_3d, yukawa_normalization_3d, yukawa_total_mass_3d,
 };
 use crate::source::SourceTerm;
 
@@ -333,7 +331,7 @@ where
     let m = boundary_dirs.max(1);
     let mut acc = Vec3::new(0.0, 0.0, 0.0);
     for _ in 0..m {
-        let xi = crate::sampling::sample_unit_sphere(rng);
+        let xi = sample_unit_sphere(rng);
         let xp = x + xi * radius;
         let up = eval_u(domain, accel, walk, observer, rng, xp);
         acc += xi * up;
@@ -378,7 +376,10 @@ where
     )
 }
 
-/// Gradient of the Poisson–Dirichlet solution in 3D via a single-ball estimator.
+/// Gradient of the Poisson–Dirichlet solution in 3D via a single-ball estimator:
+/// ∇u(x) = (3/R) E[u(x+Rξ) ξ] + ∫_B ∇ₓG_B(x,y) f(y) dy.
+///
+/// The volume term is always importance sampled with p ∝ |∇ₓG_B|; `grad.sampling` is ignored.
 ///
 /// Observer callbacks are invoked for the continuation walks sampled during the estimate.
 pub fn grad_poisson_dirichlet_wos<D, A, G, F, O>(
@@ -422,39 +423,19 @@ where
         x,
     );
 
-    // --- Volume term:  ∫_B ∇_x G f
+    // --- Volume term:  ∫_B ∇ₓG_B(x,y) f(y) dy,  ∇ₓG_B = (y−x)/(4π) · (1/r³ − 1/R³)
+    // Sample y = x + R t ξ with p(y) ∝ |∇ₓG_B|, i.e. radial pdf p(t) = (4/3)(1 − t³).
+    // The kernel cancels against the pdf, leaving the bounded weight (3R/4) f(y) ξ.
+    // (Uniform and Green-ball sampling give weights ~1/r² and ~1/r: infinite variance.)
     let k = grad.interior_samples.max(1);
-    let vol = match grad.sampling {
-        InteriorSampling::Uniform => {
-            // I ≈ Vol(B) * (1/k) Σ [ ∇_x G(x, Y_i) f(Y_i) ], Y_i ~ Unif(B)
-            let vol_ball = ball_volume(radius);
-            let mut sum = Vec3::new(0.0, 0.0, 0.0);
-            for _ in 0..k {
-                let y = sample_ball_uniform(rng, x, radius);
-                let r = (x - y).length().max(grad.min_r);
-                let grad_g = (x - y) * (-1.0 / (4.0 * PI * r * r * r)); // -(x-y)/4π r^3
-                sum += grad_g * fsrc.value(y);
-            }
-            sum * (vol_ball / k as f32)
-        }
-        InteriorSampling::GreenBall => {
-            // p(y) ∝ G(x,y) (with total mass Z = R²/6)
-            // ∫ ∇G f = E_p[ (∇G / p) f ] = Z * E_p[ (∇G / G) f ]
-            let z_mass = green_ball_3d_total_mass(radius);
-            let mut sum = Vec3::new(0.0, 0.0, 0.0);
-            for _ in 0..k {
-                let y = sample_ball_by_green_pdf(rng, x, radius);
-                let r = (x - y).length().max(grad.min_r);
-                let gval = (1.0 / (4.0 * PI)) * (1.0 / r - 1.0 / radius).max(1e-12);
-                let grad_g = (x - y) * (-1.0 / (4.0 * PI * r * r * r));
-                // weight = Z * (gradG / G)
-                let w = z_mass / gval;
-                sum += grad_g * (w * fsrc.value(y));
-            }
-            sum * (1.0 / k as f32)
-        }
-    };
+    let mut vol = Vec3::new(0.0, 0.0, 0.0);
+    for _ in 0..k {
+        let xi = sample_unit_sphere(rng);
+        let t = sample_radius_under_grad_green_pdf(rng);
+        vol += xi * fsrc.value(x + xi * (radius * t));
+    }
+    let vol = vol * (0.75 * radius / k as f32);
 
-    // ∇u = surface − volume
-    surf - vol
+    // ∇u = surface + volume
+    surf + vol
 }

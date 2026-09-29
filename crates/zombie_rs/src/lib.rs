@@ -414,7 +414,7 @@ mod tests {
         let x = Vec3::new(0.25, -0.1, 0.2);
 
         // More samples for the gradient’s surface+volume terms
-        let grad_cfg = GradParams::new(256, 64).with_sampling(InteriorSampling::GreenBall);
+        let grad_cfg = GradParams::new(256, 64);
 
         let g_est = solver.poisson_gradient(&g0, &fsrc, walk, pois, grad_cfg, &mut rng, x);
 
@@ -426,6 +426,45 @@ mod tests {
             err < 0.12,
             "Poisson grad error too large: got {g_est:?}, want {g_true:?}, |err|={err}"
         );
+    }
+
+    /// Regression for the volume term's sign and kernel: with f ≡ 1 it vanishes by symmetry,
+    /// so the constant-source test above cannot catch either.
+    ///  - PDE:   -Δu = 10x in the unit ball, u = 0 on ∂Ω,
+    ///  - exact: u = x(1 - |x|²),  ∇u = (1 - |x|² - 2x², -2xy, -2xz).
+    #[test]
+    fn grad_poisson_linear_source_matches_analytic() {
+        let ball = SdfDomain::new(|p: Vec3| p.length() - 1.0);
+        let accel = ClosestNaive;
+        let solver = Solver::builder(&ball, &accel).build();
+        let g0 = BoundaryDirichletFn::new(|_| 0.0);
+        struct Linear;
+        impl SourceTerm for Linear {
+            fn value(&self, x: Vec3) -> f32 {
+                10.0 * x.x
+            }
+        }
+
+        let walk = WalkBudget::new(1e-4, 10_000);
+        let pois = PoissonParams::new(1).with_sampling(InteriorSampling::GreenBall);
+        let grad_cfg = GradParams::new(2048, 2048);
+        let mut rng = rng::Rng::seed_from(31);
+
+        for x in [Vec3::new(0.3, 0.2, -0.1), Vec3::new(-0.25, 0.4, 0.15)] {
+            let g_est = solver.poisson_gradient(&g0, &Linear, walk, pois, grad_cfg, &mut rng, x);
+            let s = x.length_sq();
+            let g_true = Vec3::new(
+                1.0 - s - 2.0 * x.x * x.x,
+                -2.0 * x.x * x.y,
+                -2.0 * x.x * x.z,
+            );
+            let err = (g_est - g_true).length();
+
+            assert!(
+                err < 0.15,
+                "Poisson grad error too large at {x:?}: got {g_est:?}, want {g_true:?}, |err|={err}"
+            );
+        }
     }
 
     #[test]

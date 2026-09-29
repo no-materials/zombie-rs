@@ -1,7 +1,7 @@
 //! Random sampling utilities for spheres and balls.
 
 use core::f32::consts::PI;
-use libm::{cosf, coshf, powf, sinf, sinhf, sqrtf};
+use libm::{asinf, cosf, coshf, powf, sinf, sinhf, sqrtf};
 
 use crate::math::Vec3;
 use crate::rng::Rng;
@@ -28,18 +28,14 @@ pub(crate) fn sample_ball_uniform(rng: &mut Rng, center: Vec3, radius: f32) -> V
     center + dir * (radius * powf(u, 1.0 / 3.0))
 }
 
-/// Inverse CDF for t = r/R under the 3D “Green-ball” radius pdf.
-/// F(t) = 3 t^2 - 2 t^3,  t ∈ (0,1).
+/// Inverse CDF for t = r/R under the 3D “Green-ball” radius pdf p(t) = 6 t (1 - t).
+/// F(t) = 3 t^2 - 2 t^3,  t ∈ [0,1].
+///
+/// Closed form: substituting t = 1/2 + sin θ gives F = 1/2 + (1/2) sin 3θ, so
+/// θ = asin(2u - 1) / 3.
 fn inv_cdf_radius_under_green_pdf(u: f32) -> f32 {
-    // Clamp u to (0,1) and do a few Newton steps; 3 steps are plenty.
-    let mut t = u.min(1.0 - 1e-7).max(1e-7);
-    for _ in 0..3 {
-        let f = 3.0 * t * t - 2.0 * t * t * t - u;
-        let df = 6.0 * t - 6.0 * t * t;
-        let step = if df.abs() > 1e-6 { f / df } else { 0.0 };
-        t = (t - step).min(1.0 - 1e-7).max(1.0e-7);
-    }
-    t
+    let u = u.clamp(0.0, 1.0);
+    (0.5 + sinf(asinf(2.0 * u - 1.0) / 3.0)).clamp(0.0, 1.0)
 }
 
 /// Draw Y ∈ B(center,R) with pdf p(y) ∝ G_B^{3D}(x,y) (Green-ball importance sampling).
@@ -49,6 +45,18 @@ pub(crate) fn sample_ball_by_green_pdf(rng: &mut Rng, center: Vec3, radius: f32)
     let u = rng.uniform_f32().max(1e-7); // radius via inverse CDF
     let t = inv_cdf_radius_under_green_pdf(u);
     center + dir * (radius * t)
+}
+
+/// Draw t = r/R with radial pdf p(t) = (4/3)(1 - t³),  t ∈ [0,1).
+///
+/// This is the radial marginal of p(y) ∝ |∇ₓG_B(x,y)| = (r/4π)(1/r³ - 1/R³) on B(x,R),
+/// used for the Poisson gradient volume term. Sampled exactly as t = U·V^{1/4}: V^{1/4}
+/// has density 4w³, and scaling by an independent uniform gives ∫_t^1 4w² dw.
+#[inline]
+pub(crate) fn sample_radius_under_grad_green_pdf(rng: &mut Rng) -> f32 {
+    let u = rng.uniform_f32();
+    let v = rng.uniform_f32();
+    u * sqrtf(sqrtf(v))
 }
 
 /// Draw Y ∈ B(center,R) with pdf `p(y) ∝ G_c(x,y)` for the screened Yukawa kernel (App. B.2).
@@ -184,4 +192,53 @@ fn yukawa_partial_integral(r: f32, radius: f32, k: f32, sinh_k_r: f32) -> f32 {
     let term2 = r * coshf(k * diff);
     let term3 = sinhf(k * diff);
     (sinh_k_r / (k * k)) - (term2 / k) - (term3 / (k * k))
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn green_ball_radius_inverse_cdf_is_exact() {
+        let tails = [
+            1e-7, 1e-6, 1e-5, 1e-4, 1e-3, 0.999, 0.9999, 0.99999, 0.999999,
+        ];
+        let grid = (0..=1000).map(|i| i as f32 / 1000.0);
+        let mut prev = 0.0;
+        for (i, u) in grid.chain(tails).enumerate() {
+            let t = inv_cdf_radius_under_green_pdf(u);
+            let f = 3.0 * t * t - 2.0 * t * t * t;
+            assert!((0.0..=1.0).contains(&t), "t({u}) = {t} outside [0,1]");
+            assert!((f - u).abs() < 2e-6, "F(F⁻¹({u})) = {f}");
+            if i <= 1000 {
+                assert!(t >= prev, "inverse CDF not monotone at u = {u}");
+                prev = t;
+            }
+        }
+    }
+
+    #[test]
+    fn grad_green_radius_sampler_matches_pdf() {
+        // p(t) = (4/3)(1 - t³)  ⇒  F(t) = (4t - t⁴)/3.
+        let n = 200_000;
+        let mut rng = Rng::seed_from(11);
+        let mut counts = [0u32; 10];
+        for _ in 0..n {
+            let t = sample_radius_under_grad_green_pdf(&mut rng);
+            assert!((0.0..1.0).contains(&t));
+            counts[((t * 10.0) as usize).min(9)] += 1;
+        }
+        let mut cum = 0;
+        for (i, c) in counts.iter().enumerate() {
+            cum += c;
+            let t = (i + 1) as f32 / 10.0;
+            let exact = (4.0 * t - t * t * t * t) / 3.0;
+            let emp = cum as f32 / n as f32;
+            // σ ≤ sqrt(1/4n) ≈ 1.1e-3
+            assert!(
+                (emp - exact).abs() < 5e-3,
+                "F({t}): empirical {emp}, exact {exact}"
+            );
+        }
+    }
 }

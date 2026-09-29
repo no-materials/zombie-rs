@@ -137,13 +137,16 @@ pub struct GradParams {
     pub boundary_dirs: u32,
     /// Number of interior samples for the Poisson volume term.
     pub interior_samples: u32,
-    /// How to sample the Poisson volume term.
+    /// Ignored. The Poisson volume term always samples `p(y) ∝ |∇ₓG_B(x,y)|`, which gives
+    /// bounded weights; uniform and Green-ball sampling have infinite variance there.
+    #[deprecated(note = "ignored: the Poisson gradient volume term always samples p ∝ |∇ₓG_B|")]
     pub sampling: InteriorSampling,
     /// Clamp for near-singularity in kernels.
     pub min_r: f32,
 }
 
 impl GradParams {
+    #[allow(deprecated)]
     pub fn new(boundary_dirs: u32, interior_samples: u32) -> Self {
         Self {
             boundary_dirs: boundary_dirs.max(1),
@@ -152,6 +155,8 @@ impl GradParams {
             min_r: 1e-7,
         }
     }
+    #[deprecated(note = "ignored: the Poisson gradient volume term always samples p ∝ |∇ₓG_B|")]
+    #[allow(deprecated)]
     pub const fn with_sampling(self, sampling: InteriorSampling) -> Self {
         Self { sampling, ..self }
     }
